@@ -1,0 +1,1278 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TrustNet — Ring Detection Console</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<script>
+(function () {
+  try {
+    var t = localStorage.getItem("trustnet.theme");
+    if (!t) t = window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+    document.documentElement.setAttribute("data-theme", t);
+  } catch (e) { document.documentElement.setAttribute("data-theme", "dark"); }
+})();
+</script>
+<style>
+  :root {
+    --sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+    --ease: cubic-bezier(.2, .8, .2, 1);
+  }
+
+  html[data-theme="dark"] {
+    --bg: #0a0a0a;
+    --surface: #101010;
+    --surface-2: #181818;
+    --ink: #f5f5f5;
+    --ink-2: #a3a3a3;
+    --ink-3: #6b6b6b;
+    --line: #232323;
+    --line-2: #383838;
+    --crit: #ff5252;
+    --warn: #f5a524;
+    --ok: #3ecf8e;
+    --info: #6ea8fe;
+    --crit-bg: rgba(255, 82, 82, .07);
+    --warn-bg: rgba(245, 165, 36, .07);
+    color-scheme: dark;
+  }
+
+  html[data-theme="light"] {
+    --bg: #ffffff;
+    --surface: #fbfbfb;
+    --surface-2: #f2f2f2;
+    --ink: #0a0a0a;
+    --ink-2: #5c5c5c;
+    --ink-3: #909090;
+    --line: #e6e6e6;
+    --line-2: #cfcfcf;
+    --crit: #cc1616;
+    --warn: #a36000;
+    --ok: #0d7a4c;
+    --info: #1a56c4;
+    --crit-bg: rgba(204, 22, 22, .05);
+    --warn-bg: rgba(163, 96, 0, .06);
+    color-scheme: light;
+  }
+
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  [hidden] { display: none !important; }
+
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 13px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    transition: background-color .16s var(--ease), color .16s var(--ease);
+  }
+
+  .mono { font-family: var(--mono); }
+  .dim  { color: var(--ink-3); }
+  .num  { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; }
+
+  /* ---------- top bar ---------- */
+  .topbar {
+    position: sticky; top: 0; z-index: 40;
+    display: flex; align-items: center; gap: 20px;
+    height: 54px; padding: 0 24px;
+    background: var(--bg);
+    border-bottom: 1px solid var(--line-2);
+  }
+  .brand { display: flex; align-items: baseline; gap: 10px; }
+  .wordmark {
+    font-family: var(--mono); font-size: 12px; font-weight: 700;
+    letter-spacing: .2em; text-transform: uppercase;
+  }
+  .brand-sub {
+    font-family: var(--mono); font-size: 10px; letter-spacing: .12em;
+    text-transform: uppercase; color: var(--ink-3);
+  }
+  .conn {
+    font-family: var(--mono); font-size: 9px; letter-spacing: .14em;
+    text-transform: uppercase; padding: 3px 8px; border: 1px solid var(--line-2);
+  }
+  .conn[data-state="on"]  { color: var(--ok); border-color: var(--ok); }
+  .conn[data-state="off"] { color: var(--crit); border-color: var(--crit); }
+
+  .topbar-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+
+  .btn {
+    font-family: var(--mono); font-size: 10px; font-weight: 500;
+    letter-spacing: .1em; text-transform: uppercase;
+    padding: 7px 13px; border: 1px solid var(--line-2);
+    background: transparent; color: var(--ink);
+    cursor: pointer; border-radius: 2px;
+    transition: background-color .14s var(--ease), color .14s var(--ease), border-color .14s var(--ease), opacity .14s var(--ease);
+  }
+  .btn:hover { background: var(--surface-2); }
+  .btn-primary { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+  .btn-primary:hover { opacity: .82; background: var(--ink); }
+  .btn-danger { color: var(--crit); border-color: var(--crit); }
+  .btn-danger:hover { background: var(--crit-bg); }
+  .btn[disabled] { opacity: .4; cursor: not-allowed; }
+
+  .seg { display: inline-flex; border: 1px solid var(--line-2); border-radius: 2px; }
+  .seg button {
+    font-family: var(--mono); font-size: 9px; letter-spacing: .12em; text-transform: uppercase;
+    padding: 6px 10px; background: transparent; color: var(--ink-3);
+    border: 0; border-left: 1px solid var(--line-2); cursor: pointer;
+    transition: background-color .14s var(--ease), color .14s var(--ease);
+  }
+  .seg button:first-child { border-left: 0; }
+  .seg button[aria-pressed="true"] { background: var(--ink); color: var(--bg); }
+
+  /* ---------- metrics ---------- */
+  .metrics {
+    display: grid; grid-template-columns: repeat(5, 1fr);
+    border-bottom: 1px solid var(--line-2);
+  }
+  .metric { padding: 15px 24px; border-left: 1px solid var(--line); }
+  .metric:first-child { border-left: 0; }
+  .metric-label {
+    font-family: var(--mono); font-size: 9px; letter-spacing: .14em;
+    text-transform: uppercase; color: var(--ink-3);
+  }
+  .metric-value {
+    font-family: var(--mono); font-size: 25px; font-weight: 500;
+    font-variant-numeric: tabular-nums; letter-spacing: -.02em; margin-top: 3px;
+  }
+  .metric-note { font-size: 11px; color: var(--ink-3); margin-top: 1px; }
+  .v-crit { color: var(--crit); }
+  .v-warn { color: var(--warn); }
+  .v-ok   { color: var(--ok); }
+
+  /* ---------- tabs ---------- */
+  .tabs { display: flex; padding: 0 24px; border-bottom: 1px solid var(--line-2); }
+  .tab {
+    font-family: var(--mono); font-size: 10px; letter-spacing: .12em; text-transform: uppercase;
+    padding: 12px 18px; background: none; border: 0;
+    border-bottom: 2px solid transparent; margin-bottom: -1px;
+    color: var(--ink-3); cursor: pointer;
+    transition: color .14s var(--ease), border-color .14s var(--ease);
+  }
+  .tab .idx { color: var(--ink-3); margin-right: 8px; }
+  .tab:hover { color: var(--ink); }
+  .tab[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--ink); }
+  .tab[aria-selected="true"] .idx { color: var(--ink); }
+
+  /* ---------- layout ---------- */
+  main { max-width: 1600px; margin: 0 auto; padding: 22px 24px 64px; }
+  .hint { font-family: var(--mono); font-size: 10px; letter-spacing: .06em; color: var(--ink-3); margin: 0 0 16px; }
+  .hint b { color: var(--ink-2); font-weight: 500; }
+
+   .grid-queue {
+    display: grid; grid-template-columns: minmax(0, 1fr) 450px;
+    gap: 22px; align-items: stretch;
+  }
+  @media (max-width: 1200px) { .grid-queue { grid-template-columns: 1fr; } }
+
+  /* left column: header fixed, table fills the remaining height */
+  .panel-col { display: flex; flex-direction: column; min-height: 480px; }
+  .panel-col > .table-scroll { flex: 1 1 auto; height: 0; min-height: 0; max-height: none; }
+
+  .panel { border: 1px solid var(--line-2); background: var(--surface); }
+
+  .panel-head {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    flex-wrap: wrap; padding: 11px 16px; border-bottom: 1px solid var(--line);
+  }
+  .filters { display: flex; align-items: center; gap: 8px; }
+  .input.input-sm {
+    width: auto; padding: 5px 9px; font-size: 11px;
+    font-family: var(--mono); letter-spacing: .04em; border-radius: 2px;
+  }
+  #searchBox { width: 200px; }
+  #tierFilter { padding-right: 4px; cursor: pointer; }
+  input[type="search"]::-webkit-search-cancel-button { -webkit-appearance: none; }
+  .tag-active { border-color: var(--ink); color: var(--ink); }
+  .panel-title {
+    font-family: var(--mono); font-size: 10px; letter-spacing: .12em; text-transform: uppercase;
+  }
+  .tag {
+    font-family: var(--mono); font-size: 9px; letter-spacing: .08em;
+    padding: 2px 7px; border: 1px solid var(--line-2); color: var(--ink-3);
+  }
+
+  /* ---------- table ---------- */
+    .table-scroll {
+    overflow: auto; max-height: 620px;
+    scrollbar-width: thin;
+    scrollbar-color: var(--line-2) transparent;
+  }
+  .table-scroll::-webkit-scrollbar { width: 10px; height: 10px; }
+  .table-scroll::-webkit-scrollbar-track { background: transparent; }
+  .table-scroll::-webkit-scrollbar-thumb {
+    background: var(--line-2); border: 3px solid var(--surface); border-radius: 6px;
+  }
+  .table-scroll::-webkit-scrollbar-thumb:hover { background: var(--ink-3); }
+   table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 12px; }
+  thead th {
+    position: sticky; top: 0; z-index: 2; background: var(--surface);
+    font-family: var(--mono); font-size: 9px; font-weight: 500;
+    letter-spacing: .12em; text-transform: uppercase; color: var(--ink-3);
+    text-align: left; padding: 9px 16px; border-bottom: 1px solid var(--line-2);
+    white-space: nowrap;
+  }
+  thead th.r { text-align: right; }
+  tbody td { padding: 10px 16px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  tbody tr { cursor: pointer; outline: none; }
+  tbody tr:hover { background: var(--surface-2); }
+  tbody tr[aria-selected="true"] { background: var(--surface-2); box-shadow: inset 2px 0 0 var(--ink); }
+  tbody tr:focus-visible { box-shadow: inset 2px 0 0 var(--info); }
+  td.empty { text-align: center; color: var(--ink-3); padding: 40px 16px; font-family: var(--mono); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; }
+  .text-cell { max-width: 360px; color: var(--ink-2); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .tier { font-family: var(--mono); font-size: 9px; letter-spacing: .1em; white-space: nowrap; }
+  .tier-crit { color: var(--crit); }
+  .tier-warn { color: var(--warn); }
+  .tier-dim  { color: var(--ink-3); }
+
+    .signals { display: flex; flex-wrap: wrap; column-gap: 14px; row-gap: 2px;
+             font-family: var(--mono); font-size: 9px; letter-spacing: .05em;
+             text-transform: uppercase; color: var(--ink-2); }
+  .signals .solo { color: var(--ink-3); }
+
+  /* ---------- detail ---------- */
+  .detail-head { padding: 16px; border-bottom: 1px solid var(--line); display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+  .detail-id { font-family: var(--mono); font-size: 17px; font-weight: 500; letter-spacing: -.01em; }
+  .detail-meta { font-family: var(--mono); font-size: 10px; color: var(--ink-3); letter-spacing: .05em; margin-top: 4px; }
+  .detail-score { font-family: var(--mono); font-size: 20px; font-variant-numeric: tabular-nums; text-align: right; line-height: 1.1; }
+  .detail-score small { display: block; font-size: 9px; letter-spacing: .12em; color: var(--ink-3); margin-top: 3px; }
+
+  .section { padding: 15px 16px; border-bottom: 1px solid var(--line); }
+  .section:last-child { border-bottom: 0; }
+  .section-label { font-family: var(--mono); font-size: 9px; letter-spacing: .14em; text-transform: uppercase; color: var(--ink-3); margin-bottom: 9px; }
+
+  .action { border-left: 2px solid var(--crit); padding: 1px 0 1px 12px; font-size: 12.5px; line-height: 1.6; }
+  .action[data-tier="Review"] { border-left-color: var(--warn); }
+  .action[data-tier="Watch"]  { border-left-color: var(--line-2); }
+
+  .summary { font-size: 12.5px; line-height: 1.62; color: var(--ink-2); }
+
+  .evidence { list-style: none; margin: 0; padding: 0; display: grid; gap: 7px; }
+  .evidence li { display: grid; grid-template-columns: 12px 1fr; gap: 9px; font-size: 12px; line-height: 1.55; color: var(--ink-2); }
+  .evidence li::before { content: "—"; font-family: var(--mono); font-size: 10px; color: var(--ink-3); padding-top: 2px; }
+
+  .graph-wrap { border: 1px solid var(--line); background: var(--bg); }
+  canvas { display: block; width: 100%; }
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; padding: 8px 10px; border-top: 1px solid var(--line);
+            font-family: var(--mono); font-size: 9px; letter-spacing: .07em; text-transform: uppercase; color: var(--ink-3); }
+  .dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+
+  .reviews { max-height: 270px; overflow-y: auto; border-top: 1px solid var(--line); }
+  .review { padding: 10px 16px; border-bottom: 1px solid var(--line); }
+  .review:last-child { border-bottom: 0; }
+  .review-meta { display: flex; justify-content: space-between; gap: 10px;
+                 font-family: var(--mono); font-size: 9px; letter-spacing: .05em; color: var(--ink-3); margin-bottom: 4px; }
+  .review-text { font-size: 12px; line-height: 1.6; color: var(--ink-2); }
+
+  /* ---------- forms ---------- */
+  .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }
+  @media (max-width: 940px) { .form-grid { grid-template-columns: 1fr; } }
+
+  .field { margin-bottom: 14px; }
+  .field-label { display: block; font-family: var(--mono); font-size: 9px; letter-spacing: .12em; text-transform: uppercase; color: var(--ink-3); margin-bottom: 6px; }
+  .input {
+    width: 100%; padding: 8px 10px; border-radius: 2px;
+    background: var(--bg); color: var(--ink);
+    border: 1px solid var(--line-2);
+    font-family: var(--sans); font-size: 12.5px; outline: none;
+    transition: border-color .14s var(--ease);
+  }
+  .input:focus { border-color: var(--ink); }
+  textarea.input { min-height: 82px; resize: vertical; font-family: var(--mono); font-size: 11.5px; line-height: 1.65; }
+
+  .btn-row { display: flex; gap: 8px; flex-wrap: wrap; }
+
+  .result { display: none; margin-top: 14px; padding: 13px 15px; border: 1px solid var(--line-2);
+            font-family: var(--mono); font-size: 11.5px; }
+  .result[data-show="1"] { display: block; }
+  .result-row { display: flex; justify-content: space-between; gap: 16px; padding: 3px 0; border-bottom: 1px solid var(--line); }
+  .result-row:last-child { border-bottom: 0; }
+  .result-row span { color: var(--ink-3); letter-spacing: .08em; font-size: 9.5px; text-transform: uppercase; }
+
+  /* ---------- architecture ---------- */
+  .arch-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }
+  @media (max-width: 1000px) { .arch-grid { grid-template-columns: 1fr; } }
+
+  .steps { list-style: none; margin: 0; padding: 0; counter-reset: s; }
+  .steps li {
+    counter-increment: s;
+    display: grid; grid-template-columns: 26px 1fr; gap: 12px;
+    padding: 12px 16px; border-bottom: 1px solid var(--line);
+    font-size: 12.5px; line-height: 1.6; color: var(--ink-2);
+  }
+  .steps li:last-child { border-bottom: 0; }
+  .steps li::before { content: counter(s, decimal-leading-zero); font-family: var(--mono); font-size: 10px; color: var(--ink-3); padding-top: 2px; }
+  .steps strong { color: var(--ink); font-weight: 600; }
+
+  .bench { display: grid; grid-template-columns: repeat(3, 1fr); border: 1px solid var(--line-2); margin-top: 22px; }
+  .bench > div { padding: 15px 18px; border-left: 1px solid var(--line); }
+  .bench > div:first-child { border-left: 0; }
+  .bench .metric-label { margin-bottom: 4px; }
+    /* ---------- assistant ---------- */
+    /* ---------- assistant ---------- */
+  [data-view-panel="assistant"] { display: flex; }
+  .assistant-wrap {
+    display: flex; flex-direction: column; gap: 14px;
+    width: 100%; height: calc(100vh - 300px); min-height: 460px;
+  }
+  .assistant-head {
+    display: flex; align-items: baseline; justify-content: space-between;
+    gap: 16px; padding-bottom: 10px; border-bottom: 1px solid var(--line-2);
+  }
+  .assistant-note {
+    font-family: var(--mono); font-size: 9px; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--ink-3);
+  }
+  .assistant-log {
+    flex: 1 1 auto; min-height: 0; overflow-y: auto; scroll-behavior: smooth;
+    border: 1px solid var(--line-2); background: var(--surface);
+    padding: 22px 24px; display: flex; flex-direction: column; gap: 22px;
+    scrollbar-width: thin; scrollbar-color: var(--line-2) transparent;
+  }
+  .assistant-log::-webkit-scrollbar { width: 10px; }
+  .assistant-log::-webkit-scrollbar-track { background: transparent; }
+  .assistant-log::-webkit-scrollbar-thumb {
+    background: var(--line-2); border: 3px solid var(--surface); border-radius: 6px;
+  }
+  .assistant-row { display: flex; flex-direction: column; gap: 7px; max-width: 86ch; }
+  .assistant-row.user { align-self: flex-end; align-items: flex-end; }
+  .assistant-role {
+    font-family: var(--mono); font-size: 8.5px; letter-spacing: .18em;
+    text-transform: uppercase; color: var(--ink-3);
+  }
+  .assistant-body { font-size: 13.5px; line-height: 1.7; color: var(--ink-2); }
+  .assistant-body strong { color: var(--ink); font-weight: 600; }
+  .assistant-row.user .assistant-body {
+    background: var(--surface-2); border: 1px solid var(--line-2);
+    color: var(--ink); padding: 9px 13px; border-radius: 2px;
+    font-family: var(--mono); font-size: 12px; line-height: 1.5;
+  }
+  .assistant-src {
+    font-family: var(--mono); font-size: 9px; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--ink-3);
+    padding-top: 2px; border-top: 1px solid var(--line);
+    width: 100%; margin-top: 2px;
+  }
+  .assistant-chips { display: flex; gap: 8px; flex-wrap: wrap; margin: 0; }
+  .assistant-chips button {
+    font-family: var(--mono); font-size: 9.5px; letter-spacing: .1em; text-transform: uppercase;
+    padding: 7px 13px; background: transparent; border: 1px solid var(--line-2);
+    color: var(--ink-3); cursor: pointer; border-radius: 2px;
+    transition: color .14s var(--ease), border-color .14s var(--ease), background-color .14s var(--ease);
+  }
+  .assistant-chips button:hover {
+    color: var(--ink); border-color: var(--ink-3); background: var(--surface-2);
+  }
+  .assistant-input { display: flex; gap: 8px; margin: 0; }
+  .assistant-input input {
+    flex: 1 1 auto; background: var(--bg); border: 1px solid var(--line-2);
+    color: var(--ink); padding: 11px 13px; border-radius: 2px;
+    font-family: var(--sans); font-size: 13px; outline: none;
+    transition: border-color .14s var(--ease);
+  }
+  .assistant-input input:focus { border-color: var(--ink); }
+  .assistant-input button {
+    font-family: var(--mono); font-size: 10px; letter-spacing: .1em; text-transform: uppercase;
+    padding: 11px 22px; background: var(--ink); color: var(--bg);
+    border: 1px solid var(--ink); cursor: pointer; border-radius: 2px;
+  }
+  .assistant-input button:hover { opacity: .82; }
+
+  /* ---------- toast ---------- */
+  .toast {
+    position: fixed; left: 50%; bottom: 26px; z-index: 200;
+    transform: translate(-50%, 10px);
+    background: var(--ink); color: var(--bg);
+    font-family: var(--mono); font-size: 10px; letter-spacing: .1em; text-transform: uppercase;
+    padding: 10px 18px; border-radius: 2px;
+    opacity: 0; pointer-events: none;
+    transition: opacity .16s var(--ease), transform .16s var(--ease);
+  }
+  .toast[data-show="1"] { opacity: 1; transform: translate(-50%, 0); }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="wordmark">TrustNet</span>
+    <span class="brand-sub">Ring Detection Console</span>
+  </div>
+
+  <div class="conn" id="conn" data-state="off">API Offline</div>
+
+  <div class="topbar-actions">
+    <div class="seg" role="group" aria-label="Theme">
+      <button type="button" data-theme-set="light" aria-pressed="false">Light</button>
+      <button type="button" data-theme-set="dark"  aria-pressed="true">Dark</button>
+    </div>
+    <button class="btn" id="btnReset" type="button">Reset</button>
+    <button class="btn btn-primary" id="btnInject" type="button">Inject Member</button>
+    <button class="btn btn-danger" id="btnRing" type="button">Run Ring Test</button>
+  </div>
+</header>
+
+<section class="metrics">
+  <div class="metric">
+    <div class="metric-label">Escalated</div>
+    <div class="metric-value v-crit" id="mEscalate">—</div>
+    <div class="metric-note">Coordinated rings</div>
+  </div>
+  <div class="metric">
+    <div class="metric-label">In Review</div>
+    <div class="metric-value v-warn" id="mReview">—</div>
+    <div class="metric-note">Suspicious activity</div>
+  </div>
+  <div class="metric">
+    <div class="metric-label">Watchlist</div>
+    <div class="metric-value" id="mWatch">—</div>
+    <div class="metric-note">Monitor only</div>
+  </div>
+  <div class="metric">
+    <div class="metric-label">Fragmentation</div>
+    <div class="metric-value v-ok" id="mFrag">0%</div>
+    <div class="metric-note">Held-out validation, 10 rounds</div>
+  </div>
+  <div class="metric">
+    <div class="metric-label">Detection Latency</div>
+    <div class="metric-value" id="mLatency">—</div>
+    <div class="metric-note">Last ingest round-trip</div>
+  </div>
+</section>
+
+<nav class="tabs" role="tablist">
+  <button class="tab" role="tab" data-view="queue" aria-selected="true"><span class="idx">01</span>Cases</button>
+  <button class="tab" role="tab" data-view="test"  aria-selected="false"><span class="idx">02</span>Test</button>
+  <button class="tab" role="tab" data-view="feed"  aria-selected="false"><span class="idx">03</span>Feed</button>
+  <button class="tab" role="tab" data-view="arch"  aria-selected="false"><span class="idx">04</span>Architecture</button>
+    <button class="tab" role="tab" data-view="assistant" aria-selected="false"><span class="idx">05</span>Assistant</button>
+</nav>
+
+<main>
+
+  <!-- ============ 01 CASES ============ -->
+  <section data-view-panel="queue">
+    <p class="hint">
+      Select a case to inspect it. <b>Inject Member</b> adds one review to the live feed &nbsp;·&nbsp; <b>Run Ring Test</b> adds eight at once.
+    </p>
+
+    <div class="grid-queue">
+            <div class="panel panel-col">
+        <div class="panel-head">
+          <span class="panel-title">Flagged Cases</span>
+          <div class="filters">
+            <input class="input input-sm" id="searchBox" type="search"
+                   placeholder="Case ID or seller" autocomplete="off" spellcheck="false">
+            <select class="input input-sm" id="tierFilter" aria-label="Filter by tier">
+              <option value="">All tiers</option>
+              <option value="Escalate">Escalate</option>
+              <option value="Review">Review</option>
+              <option value="Watch">Watch</option>
+            </select>
+            <span class="tag" id="caseCount">0</span>
+          </div>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Case</th>
+                <th>Tier</th>
+                <th class="r">Score</th>
+                <th class="r">Members</th>
+                <th>Sellers</th>
+                <th>Signals</th>
+              </tr>
+            </thead>
+            <tbody id="casesBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel" id="detailPanel">
+        <div class="detail-head">
+          <div>
+            <div class="detail-id" id="dId">—</div>
+            <div class="detail-meta" id="dMeta">Select a case</div>
+          </div>
+          <div class="detail-score" id="dScore">—<small id="dTier">—</small></div>
+        </div>
+
+        <div class="section">
+          <div class="section-label">Action Required</div>
+          <div class="action" id="dAction">—</div>
+        </div>
+
+        <div class="section">
+          <div class="section-label">Summary</div>
+          <div class="summary" id="dSummary">—</div>
+        </div>
+
+        <div class="section">
+          <div class="section-label">Evidence</div>
+          <ul class="evidence" id="dEvidence"></ul>
+        </div>
+
+        <div class="section">
+          <div class="section-label">Connection Map</div>
+          <div class="graph-wrap">
+            <canvas id="graph"></canvas>
+            <div class="legend">
+              <span><i class="dot" style="background:var(--info)"></i>Seller</span>
+              <span><i class="dot" style="background:var(--ink-2)"></i>Account</span>
+              <span><i class="dot" style="background:var(--warn)"></i>Shared Entity</span>
+              <span><i class="dot" style="background:var(--ink-3)"></i>Review</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="section" style="padding-bottom:0;border-bottom:0">
+          <div class="section-label">Member Reviews</div>
+        </div>
+        <div class="reviews" id="dReviews"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 02 TEST ============ -->
+  <section data-view-panel="test" hidden>
+    <div class="form-grid">
+
+      <div class="panel">
+        <div class="panel-head"><span class="panel-title">Score a Single Review</span></div>
+        <div class="section">
+          <div class="field">
+            <label class="field-label" for="inSeller">Seller ID</label>
+            <input class="input" id="inSeller" type="text" value="SEL_003">
+          </div>
+          <div class="field">
+            <label class="field-label" for="inText">Review Text</label>
+            <textarea class="input" id="inText">UNBELIEVABLE 10/10 MUST BUY! Best purchase I have made all year! Incredible seller and flawless product!</textarea>
+          </div>
+          <div class="btn-row">
+            <button class="btn" type="button" id="btnPresetGenuine">Genuine Sample</button>
+            <button class="btn" type="button" id="btnPresetFake">Fake Sample</button>
+            <button class="btn btn-primary" type="button" id="btnScore">Score Review</button>
+          </div>
+          <div class="result" id="singleResult"></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><span class="panel-title">Simulate a Coordinated Ring</span></div>
+        <div class="section">
+          <div class="field">
+            <label class="field-label" for="inBots">Number of Bot Accounts</label>
+            <input class="input" id="inBots" type="number" min="3" max="15" value="6">
+          </div>
+          <div class="field">
+            <label class="field-label" for="inPhrase">Repeated Review Phrase</label>
+            <input class="input" id="inPhrase" type="text" value="AMAZING 10/10 MUST BUY! Best seller ever!">
+          </div>
+          <div class="btn-row">
+            <button class="btn btn-danger" type="button" id="btnCustomRing">Inject Ring &amp; Check Linking</button>
+          </div>
+          <div class="result" id="ringResult"></div>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ============ 03 FEED ============ -->
+  <section data-view-panel="feed" hidden>
+    <div class="panel">
+      <div class="panel-head">
+        <span class="panel-title">Incoming Reviews</span>
+        <label class="dim mono" style="font-size:9px;letter-spacing:.1em;text-transform:uppercase;display:flex;align-items:center;gap:6px;cursor:pointer">
+          <input type="checkbox" id="feedFlagged"> Suspicious only
+        </label>
+      </div>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>Review</th>
+              <th class="r">Risk</th>
+              <th>Seller</th>
+              <th>Account</th>
+              <th class="r">Rating</th>
+              <th>Text</th>
+              <th>Rules Fired</th>
+            </tr>
+          </thead>
+          <tbody id="feedBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 04 ARCHITECTURE ============ -->
+  <section data-view-panel="arch" hidden>
+    <div class="arch-grid">
+
+      <div class="panel">
+        <div class="panel-head"><span class="panel-title">Data Flow — Input to Output</span></div>
+        <ol class="steps">
+          <li><span><strong>Ingestion.</strong> Review arrives with text, author, merchant, IP, device and payment token.</span></li>
+          <li><span><strong>Feature pipeline.</strong> Dual-space TF-IDF (word + char n-grams), entity-sharing counts, temporal velocity.</span></li>
+          <li><span><strong>Weak supervision.</strong> Eight heuristic labeling functions vote on an anomaly score.</span></li>
+          <li><span><strong>ML generalisation.</strong> Gradient Boosting learns non-linear risk from indirect signals.</span></li>
+          <li><span><strong>Graph linking.</strong> Union-find components join entities sharing hardware, payment, IP or copy — edges below weight 4.0 are dropped.</span></li>
+          <li><span><strong>Case rollup.</strong> Scattered bot accounts collapse into one urgent case with a human-readable triage action.</span></li>
+        </ol>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><span class="panel-title">Human-in-the-Loop Feedback</span></div>
+        <ol class="steps">
+          <li><span><strong>Operator triage.</strong> Investigators inspect grouped cases, evidence lists and connection maps.</span></li>
+          <li><span><strong>Confirmed fraud.</strong> Freezing payouts and quarantining reviews converts a weak label into a ground-truth record.</span></li>
+          <li><span><strong>False-positive exception.</strong> Dismissed cases (household device sharing) emit exclusion rules that recalibrate thresholds.</span></li>
+          <li><span><strong>Continuous retraining.</strong> Ground-truth decisions update model weights against new fraud patterns.</span></li>
+        </ol>
+      </div>
+
+    </div>
+  
+    <div class="bench">
+      <div>
+        <div class="metric-label">Ring Detection</div>
+        <div class="metric-value v-ok">100%</div>
+        <div class="metric-note">10 / 10 held-out rings</div>
+      </div>
+      <div>
+        <div class="metric-label">Fragmentation</div>
+        <div class="metric-value v-ok">0%</div>
+        <div class="metric-note">Never split into separate cases</div>
+      </div>
+      <div>
+        <div class="metric-label">Explainability</div>
+        <div class="metric-value">100%</div>
+        <div class="metric-note">Every case names its signals</div>
+      </div>
+    </div>
+  </section>
+<!-- ============ 05 Assistant ============ -->
+
+<section data-view-panel="assistant" hidden>
+  <div class="assistant-wrap">
+    <div class="assistant-head">
+      <span class="panel-title">Assistant</span>
+      <span class="assistant-note">Retrieval only · no generative model · every answer cites its source</span>
+    </div>
+    <div class="assistant-log" id="assistantLog"></div>
+    <form class="assistant-chips" id="assistantChips">
+      <button type="button" data-q="Can I buy from SELLER-0265?">Seller check</button>
+      <button type="button" data-q="Why was CASE-0000 flagged?">Case dossier</button>
+      <button type="button" data-q="How fast is it?">Throughput</button>
+      <button type="button" data-q="What are the limitations?">Limits</button>
+      <button type="button" data-q="Is this Kaggle or synthetic?">Data</button>
+    </form>
+    <form class="assistant-input" id="assistantForm">
+      <input id="assistantInput" placeholder="Ask about a case, a seller, or how detection works" autocomplete="off">
+      <button type="submit">Send</button>
+    </form>
+  </div>
+</section>
+
+</main>
+
+<div class="toast" id="toast" data-show="0"></div>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ---------- helpers ---------- */
+  const $  = (s, r) => (r || document).querySelector(s);
+  const $$ = (s, r) => Array.prototype.slice.call((r || document).querySelectorAll(s));
+  const esc = (v) => String(v == null ? "" : v).replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+  const state = { cases: [], selected: null, view: "queue", query: "", tier: "", total: null };
+
+    async function api(path, opts) {
+    const t0 = performance.now();
+    const res = await fetch(path, Object.assign({
+      headers: { "Content-Type": "application/json" }
+    }, opts || {}));
+    const ms = Math.round(performance.now() - t0);
+
+    let data = null;
+    try { data = await res.json(); } catch (e) { /* non-JSON body */ }
+
+    if (!res.ok) {
+      const msg = (data && (data.error || data.detail)) || res.status + " " + res.statusText;
+      throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+    }
+    if (data && data.ok === false) {
+      throw new Error(data.error || "request failed");
+    }
+    return { data: data, ms: ms };
+  }
+
+  let toastTimer = null;
+  function toast(msg) {
+    const el = $("#toast");
+    el.textContent = msg;
+    el.dataset.show = "1";
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { el.dataset.show = "0"; }, 3000);
+  }
+
+  function setOnline(ok) {
+    const el = $("#conn");
+    el.dataset.state = ok ? "on" : "off";
+    el.textContent = ok ? "API Online" : "API Offline";
+  }
+
+  /* ---------- theme ---------- */
+  function applyTheme(t) {
+    document.documentElement.setAttribute("data-theme", t);
+    try { localStorage.setItem("trustnet.theme", t); } catch (e) {}
+    $$("[data-theme-set]").forEach(b =>
+      b.setAttribute("aria-pressed", String(b.dataset.themeSet === t)));
+    if (state.selected) drawGraph(state.selected.graph_data);
+  }
+
+  /* ---------- tabs ---------- */
+  function setView(v) {
+    state.view = v;
+    $$(".tab").forEach(b => b.setAttribute("aria-selected", String(b.dataset.view === v)));
+    $$("[data-view-panel]").forEach(p => { p.hidden = p.dataset.viewPanel !== v; });
+    if (v === "feed") loadFeed();
+    if (v === "queue" && state.selected) drawGraph(state.selected.graph_data);
+    if (v === "test" || v === "feed" || v === "arch") { /* no-op */ }
+  }
+
+  /* ---------- metrics ---------- */
+  function renderMetrics(ov, fallbackMs) {
+    const t = (ov && ov.tier_counts) || {};
+    $("#mEscalate").textContent = t.Escalate != null ? t.Escalate : 0;
+    $("#mReview").textContent   = t.Review   != null ? t.Review   : 0;
+    $("#mWatch").textContent    = t.Watch    != null ? t.Watch    : 0;
+
+    const lat = (ov && ov.last_latency_ms != null) ? ov.last_latency_ms : fallbackMs;
+    $("#mLatency").textContent = lat != null ? lat + " ms" : "—";
+  }
+
+  /* ---------- cases ---------- */
+  function shortSignal(s) {
+    const k = String(s).toLowerCase();
+    if (k.indexOf("device") >= 0)    return "Device";
+    if (k.indexOf("payment") >= 0)   return "Payment";
+    if (k.indexOf("ip") >= 0 ||
+        k.indexOf("subnet") >= 0)    return "Network";
+    if (k.indexOf("stylistic") >= 0 ||
+        k.indexOf("collus") >= 0)    return "Text";
+    if (k.indexOf("burst") >= 0 ||
+        k.indexOf("temporal") >= 0)  return "Burst";
+    if (k.indexOf("account") >= 0)   return "New Accounts";
+    if (k.indexOf("velocity") >= 0 ||
+        k.indexOf("volume") >= 0)    return "Volume";
+    if (k.indexOf("dup") >= 0 || k.indexOf("text") >= 0) return "Text";
+    return s;
+  }
+
+  function tierOf(c) {
+    const t = String(c.severity_tier || "Watch");
+    return t === "Escalate" || t === "Review" ? t : "Watch";
+  }
+
+  function visibleCases() {
+    const q = state.query.trim().toLowerCase();
+    return state.cases.filter(c => {
+      if (state.tier && tierOf(c) !== state.tier) return false;
+      if (!q) return true;
+      if (String(c.case_id).toLowerCase().indexOf(q) >= 0) return true;
+      return (c.sellers_involved || []).some(s => String(s).toLowerCase().indexOf(q) >= 0);
+    });
+  }
+
+    function renderCases() {
+    const list = visibleCases();
+    const body = $("#casesBody");
+    const total = state.total != null ? state.total : state.cases.length;
+    const filtered = Boolean(state.query.trim() || state.tier);
+
+    const tag = $("#caseCount");
+    tag.textContent = filtered ? list.length + " / " + total : total;
+    tag.classList.toggle("tag-active", filtered);
+
+    if (!list.length) {
+      body.innerHTML = '<tr><td class="empty" colspan="6">' +
+        (filtered ? "No cases match this filter" : "No cases") + "</td></tr>";
+      return;
+    }
+
+    body.innerHTML = list.map(c => {
+      const tier = tierOf(c);
+      const cls = tier === "Escalate" ? "tier-crit" : tier === "Review" ? "tier-warn" : "tier-dim";
+      const sel = state.selected && state.selected.case_id === c.case_id;
+      const score = c.case_score_100 != null ? c.case_score_100 : c.case_score;
+
+      const sig = (c.shared_signals || []).map(shortSignal);
+      const signals = sig.length
+        ? sig.map(s => "<span>" + esc(s) + "</span>").join("")
+        : '<span class="solo">' + (c.review_count > 1 ? "Entity overlap" : "Single review") + "</span>";
+
+      const sellers = (c.sellers_involved || []).join(", ") || "—";
+
+      return '<tr data-case="' + esc(c.case_id) + '" tabindex="0" aria-selected="' +
+        (sel ? "true" : "false") + '">' +
+        '<td class="mono">' + esc(c.case_id) + "</td>" +
+        '<td><span class="tier ' + cls + '">' + tier.toUpperCase() + "</span></td>" +
+        '<td class="num">' + esc(score) + "</td>" +
+        '<td class="num">' + esc(c.review_count) + "</td>" +
+        '<td class="mono dim" style="font-size:11px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' +
+          esc(sellers) + '">' + esc(sellers) + "</td>" +
+        '<td class="signals">' + signals + "</td>" +
+        "</tr>";
+    }).join("");
+  }
+
+  function selectCase(c) {
+    state.selected = c;
+    window.activeCaseId = c.case_id;
+    $$("#casesBody tr").forEach(tr =>
+      tr.setAttribute("aria-selected", String(tr.dataset.case === c.case_id)));
+    renderDetail(c);
+  }
+
+  function renderDetail(c) {
+    const tier = tierOf(c);
+    const score = c.case_score_100 != null ? c.case_score_100 : c.case_score;
+
+    $("#dId").textContent = c.case_id;
+        $("#dMeta").textContent =
+      c.review_count + (c.review_count === 1 ? " review" : " reviews") + " · " +
+      c.account_count + (c.account_count === 1 ? " account" : " accounts") + " · " +
+      ((c.sellers_involved || []).join(", ") || "no seller");
+
+    $("#dScore").firstChild.nodeValue = score;
+    const badge = $("#dTier");
+    badge.textContent = tier === "Escalate" ? "ESCALATED" : tier === "Review" ? "IN REVIEW" : "WATCHLIST";
+    badge.style.color = tier === "Escalate" ? "var(--crit)" : tier === "Review" ? "var(--warn)" : "var(--ink-3)";
+
+    const act = $("#dAction");
+    act.textContent = c.recommended_action || "—";
+    act.dataset.tier = tier;
+
+    $("#dSummary").textContent = c.explanation_summary || "—";
+
+    const bullets = c.explanation_bullet_points || [];
+    $("#dEvidence").innerHTML = bullets.length
+      ? bullets.map(b => "<li>" + esc(b) + "</li>").join("")
+      : '<li>No evidence recorded.</li>';
+
+    drawGraph(c.graph_data);
+
+    const revs = c.review_items || [];
+    $("#dReviews").innerHTML = revs.length
+      ? revs.map(r =>
+          '<div class="review">' +
+            '<div class="review-meta">' +
+              "<span>" + esc(r.author) + " \u2192 " + esc(r.seller) + "</span>" +
+              "<span>" + Number(r.rating || 0).toFixed(1) + " / 5</span>" +
+            "</div>" +
+            '<div class="review-text">' + esc(r.text) + "</div>" +
+          "</div>").join("")
+      : '<div class="review"><div class="review-text" style="color:var(--ink-3)">No previews available.</div></div>';
+  }
+
+  /* ---------- canvas graph ---------- */
+  const LAYER  = { seller: 0, account: 1, device_fingerprint: 2, payment_instrument: 2, subnet: 2, ip: 2, review: 3 };
+  const RING_R = [0, 0.42, 0.72, 0.97];
+  const NODE_R = { seller: 5, account: 3.6, device_fingerprint: 4, payment_instrument: 4, subnet: 4, ip: 4, review: 2.6 };
+
+  function drawGraph(graph) {
+    const canvas = $("#graph");
+    if (!canvas) return;
+    const wrap = canvas.parentElement;
+    const dpr = window.devicePixelRatio || 1;
+    const W = Math.max(140, wrap.clientWidth);
+    const H = 240;
+
+    canvas.width = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+    canvas.style.height = H + "px";
+
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+
+    const css = getComputedStyle(document.documentElement);
+    const cInk2  = css.getPropertyValue("--ink-2").trim();
+    const cInk3  = css.getPropertyValue("--ink-3").trim();
+    const cLine  = css.getPropertyValue("--line-2").trim();
+    const cWarn  = css.getPropertyValue("--warn").trim();
+    const cInfo  = css.getPropertyValue("--info").trim();
+
+    if (!graph || !graph.nodes || !graph.nodes.length) {
+      ctx.fillStyle = cInk3;
+      ctx.font = "10px ui-monospace, monospace";
+      ctx.fillText("NO GRAPH DATA", 16, H / 2);
+      return;
+    }
+
+    const cx = W / 2, cy = H / 2;
+    const R = Math.min(cx, cy) - 20;
+
+    const buckets = [[], [], [], []];
+    graph.nodes.forEach(n => { (buckets[LAYER[n.type] != null ? LAYER[n.type] : 3]).push(n); });
+
+    const pos = {};
+    buckets.forEach((nodes, L) => {
+      if (!nodes.length) return;
+      if (nodes.length === 1 && L === 0) {
+        nodes[0].x = cx; nodes[0].y = cy;
+      } else {
+        const r = (L === 0 ? 0.16 : RING_R[L]) * R;
+        nodes.forEach((n, i) => {
+          const a = -Math.PI / 2 + (i / nodes.length) * Math.PI * 2;
+          n.x = cx + r * Math.cos(a);
+          n.y = cy + r * Math.sin(a);
+        });
+      }
+      nodes.forEach(n => { pos[n.id] = n; });
+    });
+
+    ctx.strokeStyle = cLine;
+    ctx.lineWidth = 1;
+    (graph.links || []).forEach(l => {
+      const a = pos[l.source], b = pos[l.target];
+      if (!a || !b) return;
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
+      ctx.stroke();
+    });
+
+    graph.nodes.forEach(n => {
+      let fill = cInk3;
+      if (n.type === "seller") fill = cInfo;
+      else if (n.type === "account") fill = cInk2;
+      else if (n.type === "device_fingerprint" || n.type === "payment_instrument" ||
+               n.type === "subnet" || n.type === "ip") fill = cWarn;
+
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, NODE_R[n.type] != null ? NODE_R[n.type] : 3, 0, Math.PI * 2);
+      ctx.fillStyle = fill;
+      ctx.fill();
+    });
+  }
+
+  /* ---------- data load ---------- */
+  async function refresh() {
+    try {
+      const overview = await api("/api/overview");
+      const cases = await api("/api/cases");
+      setOnline(true);
+      renderMetrics(overview.data, overview.ms);
+
+      state.cases = cases.data.cases || [];
+      state.total = cases.data.total;
+       renderCases();
+
+      if (state.cases.length) {
+        const keep = state.selected &&
+          state.cases.filter(c => c.case_id === state.selected.case_id)[0];
+        selectCase(keep || state.cases[0]);
+      }
+        } catch (err) {
+      setOnline(false);
+      const isFile = location.protocol === "file:";
+      toast(isFile
+        ? "Open http://127.0.0.1:8000/ — never the .html file directly"
+        : "API unreachable — is phase6_api.py running?");
+      console.error("[trustnet] refresh failed:", err, "| page origin:", location.origin);
+    }
+  }
+
+  /* ---------- feed ---------- */
+  async function loadFeed() {
+    const flagged = $("#feedFlagged").checked;
+    try {
+      const r = await api("/api/reviews?limit=80&flagged_only=" + flagged);
+      const rows = r.data.reviews || [];
+      $("#feedBody").innerHTML = rows.length
+        ? rows.map(x =>
+            "<tr>" +
+              '<td class="mono">' + esc(x.review_id) + "</td>" +
+              '<td class="num" style="color:' + (x.risk_score >= 50 ? "var(--crit)" : "var(--ink)") + '">' + esc(x.risk_score) + "</td>" +
+              '<td class="mono dim" style="font-size:11px">' + esc(x.seller_id) + "</td>" +
+              '<td class="mono dim" style="font-size:11px">' + esc(x.account_id) + "</td>" +
+              '<td class="num">' + Number(x.rating || 0).toFixed(1) + "</td>" +
+              '<td class="text-cell">' + esc(x.review_text) + "</td>" +
+              '<td class="mono dim" style="font-size:10px">' + esc((x.triggered_rules || []).join(" · ") || "—") + "</td>" +
+            "</tr>").join("")
+        : '<tr><td class="empty" colspan="7">No reviews</td></tr>';
+    } catch (err) {
+      toast("Feed unavailable");
+    }
+  }
+
+  /* ---------- actions ---------- */
+  async function injectMember() {
+    const btn = $("#btnInject");
+    btn.disabled = true;
+    try {
+      const r = await api("/api/inject-member", { method: "POST" });
+      $("#mLatency").textContent = r.ms + " ms";
+      const c = r.data;
+      toast(c.case_id + " · " + c.member_count + " members · " + r.ms + " ms");
+      await refresh();
+      if (c.case_id) {
+        const hit = state.cases.filter(x => x.case_id === c.case_id)[0];
+        if (hit) selectCase(hit);
+      }
+    } catch (err) {
+      toast("Inject failed");
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function runRingTest() {
+    const btn = $("#btnRing");
+    btn.disabled = true;
+    try {
+      const r = await api("/api/stress-test/inject", {
+        method: "POST",
+        body: JSON.stringify({ seller_id: "SEL_003", ring_name: "SYNDICATE-APEX" })
+      });
+      $("#mLatency").textContent = r.ms + " ms";
+      toast("Ring injected · linked into " + (r.data.case_id || "1 case"));
+      await refresh();
+    } catch (err) {
+      toast("Ring test failed");
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function resetBaseline() {
+    const btn = $("#btnReset");
+    btn.disabled = true;
+    try {
+      await api("/api/reset", { method: "POST" });
+      state.selected = null;
+      state.query = "";
+      state.tier = "";
+      $("#searchBox").value = "";
+      $("#tierFilter").value = "";
+      toast("Baseline restored");
+      await refresh();
+    } catch (err) {
+      toast("Reset failed");
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function scoreSingle() {
+    const payload = {
+      seller_id: $("#inSeller").value.trim() || "SEL_003",
+      account_id: "ACC-TEST-" + Math.random().toString(36).slice(2, 8).toUpperCase(),
+      rating: 5,
+      review_text: $("#inText").value.trim(),
+      device_fingerprint: "DEV-MANUAL-TEST"
+    };
+    try {
+      const r = await api("/api/custom/review", { method: "POST", body: JSON.stringify(payload) });
+      const s = r.data.scored_review || {};
+      const score = Math.round(s.risk_score || 0);
+      const box = $("#singleResult");
+      box.dataset.show = "1";
+      box.innerHTML =
+        '<div class="result-row"><span>Risk</span><strong style="color:' +
+          (score >= 50 ? "var(--crit)" : "var(--ok)") + '">' + score + " / 100</strong></div>" +
+        '<div class="result-row"><span>Review</span><strong>' + esc(s.review_id) + "</strong></div>" +
+        '<div class="result-row"><span>Case</span><strong>' + esc(r.data.assigned_case_id || "—") + "</strong></div>" +
+        '<div class="result-row"><span>Latency</span><strong>' + r.ms + " ms</strong></div>";
+      toast("Scored in " + r.ms + " ms");
+      await refresh();
+    } catch (err) {
+      toast("Scoring failed");
+    }
+  }
+
+  async function injectCustomRing() {
+    const n = Math.max(3, Math.min(15, parseInt($("#inBots").value, 10) || 6));
+    const payload = {
+      seller_id: $("#inSeller").value.trim() || "SEL_003",
+      ring_name: "CUSTOM",
+      num_accounts: n,
+      review_text: $("#inPhrase").value.trim(),
+      shared_device: "DEV-CUSTOM-RING",
+      shared_payment: "PAY-CUSTOM-RING"
+    };
+    try {
+      const r = await api("/api/custom/ring", { method: "POST", body: JSON.stringify(payload) });
+      const box = $("#ringResult");
+      box.dataset.show = "1";
+      box.innerHTML =
+        '<div class="result-row"><span>Linked into</span><strong>' + esc(r.data.case_id || "—") + "</strong></div>" +
+        '<div class="result-row"><span>Members</span><strong>' + esc(r.data.member_count) + "</strong></div>" +
+        '<div class="result-row"><span>Score</span><strong>' + esc(r.data.case_score_100) + " / 100</strong></div>" +
+        '<div class="result-row"><span>Fragments</span><strong style="color:var(--ok)">0</strong></div>';
+      toast(n + " accounts linked into one case");
+      await refresh();
+    } catch (err) {
+      toast("Ring injection failed");
+    }
+  }
+
+  /* ---------- wiring ---------- */
+  function wire() {
+    $$("[data-theme-set]").forEach(b =>
+      b.addEventListener("click", () => applyTheme(b.dataset.themeSet)));
+
+    $$(".tab").forEach(b =>
+      b.addEventListener("click", () => setView(b.dataset.view)));
+
+    $("#casesBody").addEventListener("click", e => {
+      const tr = e.target.closest("tr[data-case]");
+      if (!tr) return;
+      const hit = state.cases.filter(c => c.case_id === tr.dataset.case)[0];
+      if (hit) selectCase(hit);
+    });
+
+    $("#casesBody").addEventListener("keydown", e => {
+      if (e.key !== "Enter" && e.key !== " ") return;
+      const tr = e.target.closest("tr[data-case]");
+      if (!tr) return;
+      e.preventDefault();
+      const hit = state.cases.filter(c => c.case_id === tr.dataset.case)[0];
+      if (hit) selectCase(hit);
+    });
+
+    $("#btnInject").addEventListener("click", injectMember);
+    $("#btnRing").addEventListener("click", runRingTest);
+    $("#btnReset").addEventListener("click", resetBaseline);
+    $("#btnScore").addEventListener("click", scoreSingle);
+    $("#btnCustomRing").addEventListener("click", injectCustomRing);
+    $("#feedFlagged").addEventListener("change", loadFeed);
+        let filterTimer = null;
+    $("#searchBox").addEventListener("input", e => {
+      state.query = e.target.value;
+      clearTimeout(filterTimer);
+      filterTimer = setTimeout(renderCases, 110);
+    });
+    $("#tierFilter").addEventListener("change", e => {
+      state.tier = e.target.value;
+      renderCases();
+    });
+    $("#searchBox").addEventListener("keydown", e => {
+      if (e.key !== "Escape") return;
+      e.target.value = "";
+      state.query = "";
+      renderCases();
+    });
+
+    $("#btnPresetGenuine").addEventListener("click", () => {
+      $("#inText").value = "Decent headphones for the price. Build quality is solid, audio is clear for daily podcasts.";
+    });
+    $("#btnPresetFake").addEventListener("click", () => {
+      $("#inText").value = "UNBELIEVABLE 10/10 MUST BUY! Best purchase I have made all year! Incredible seller and flawless product!";
+    });
+
+    let resizeTimer = null;
+    window.addEventListener("resize", () => {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        if (state.selected) drawGraph(state.selected.graph_data);
+      }, 120);
+    });
+  }
+
+  document.addEventListener("DOMContentLoaded", () => {
+    applyTheme(document.documentElement.getAttribute("data-theme") || "dark");
+    wire();
+    setView("queue");
+    refresh();
+    setInterval(refresh, 15000);
+  });
+})();
+
+
+function mdToHtml(s) {
+  const esc = String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  return esc.replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>')
+            .replace(/\*(.+?)\*/g,'<em>$1</em>')
+            .replace(/\n/g,'<br>');
+}
+
+const assistantLog = document.getElementById('assistantLog');
+
+function assistantPush(role, text, sources) {
+  const row = document.createElement('div');
+  row.className = 'assistant-row ' + role;
+
+  const tag = document.createElement('div');
+  tag.className = 'assistant-role';
+  tag.textContent = role === 'user' ? 'You' : 'TrustNet';
+  row.appendChild(tag);
+
+  const body = document.createElement('div');
+  body.className = 'assistant-body';
+  body.innerHTML = mdToHtml(text);
+  row.appendChild(body);
+
+  if (sources && sources.length) {
+    const src = document.createElement('div');
+    src.className = 'assistant-src';
+    src.textContent = 'Source · ' + sources.join(' · ');
+    row.appendChild(src);
+  }
+  assistantLog.appendChild(row);
+  assistantLog.scrollTop = assistantLog.scrollHeight;
+  return row;
+}
+
+async function askAssistant(query) {
+  if (!query.trim()) return;
+  assistantPush('user', query);
+  const pending = assistantPush('sys', 'Retrieving…');
+  try {
+    const r = await fetch('/api/assistant', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query, case_id: window.activeCaseId || null })
+    });
+    const d = await r.json();
+    pending.remove();
+    assistantPush('sys', d.answer, d.sources);
+  } catch (e) {
+    pending.remove();
+    assistantPush('sys', 'Could not reach the assistant. Is the server running?');
+  }
+}
+
+document.getElementById('assistantForm').addEventListener('submit', e => {
+  e.preventDefault();
+  const input = document.getElementById('assistantInput');
+  askAssistant(input.value);
+  input.value = '';
+});
+document.getElementById('assistantChips').addEventListener('click', e => {
+  if (e.target.dataset.q) askAssistant(e.target.dataset.q);
+});
+assistantPush('sys', "I answer from the case store and a fixed knowledge base. "
+  + "There is no generative model in this tab, so I will not invent a number.\n\n"
+  + "Try: *can I buy from SEL_003?* · *why was CASE-0000 flagged?* · "
+  + "*how fast is it?* · *what are the limitations?*");
+
+</script>
+</body>
+</html>

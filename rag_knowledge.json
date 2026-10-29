@@ -1,0 +1,92 @@
+[
+  {
+    "id": "what_is_trustnet",
+    "keywords": ["what is", "about", "project", "purpose", "goal", "summary", "how it works", "trustnet"],
+    "question": "What is TrustNet and what problem does it solve?",
+    "answer": "TrustNet is a fraud detector for online marketplaces. A fake review ring is a group of accounts that all post glowing reviews for the same seller. Reading one review at a time cannot catch it, because each individual review looks completely normal. TrustNet looks behind the reviews instead: which accounts share a device, share a payment card, post from the same IP range, copy each other's wording, or post within minutes of each other. When several of those line up on the same set of accounts, it collapses the whole ring into one case for a human to review. The result that matters: one high-priority case, not dozens of scattered flags."
+  },
+  {
+    "id": "how_it_catches_rings",
+    "keywords": ["catch", "detect", "clues", "signals", "how does it catch", "device", "card", "ip", "burst", "text"],
+    "question": "How does TrustNet catch a fake review ring?",
+    "answer": "Five signals, each independent of the others. One: shared device fingerprint, meaning different accounts posting from the same hardware. Two: shared payment instrument, meaning several orders funded by the same token. Three: shared IP range, meaning accounts clustered in one subnet. Four: near-duplicate text, meaning copy-pasted or lightly reworded templates. Five: posting burst, meaning many reviews inside a short window. Any single one of those can happen by accident. Several of them agreeing on the same accounts cannot."
+  },
+  {
+    "id": "why_graph_not_just_ai",
+    "keywords": ["graph", "linking", "network", "connect", "why graph", "connected components", "networkx", "gnn"],
+    "question": "Why a graph instead of just a text classifier?",
+    "answer": "Because a well-run ring writes reviews that each look harmless. A text model reading 'Great product, 10/10' has nothing to work with. A graph does: it records that five accounts share one device, one payment token and one IP range, and that single fact is invisible to any per-review model. The other two reasons are speed and explanation. Graph linking resolves in single-digit milliseconds instead of seconds, and every connection carries a plain reason attached to it — shared device, shared payment — where a neural embedding gives you a number and no sentence."
+  },
+  {
+    "id": "graph_filter_false_positives",
+    "keywords": ["false positive", "family", "office", "wifi", "same ip", "shared ip", "mega cluster", "edge weight", "threshold", "4.0", "innocent"],
+    "question": "Don't people on the same office Wi-Fi look like a ring?",
+    "answer": "That was the biggest engineering problem in the build, and it has a specific fix. A single shared signal creates a connection but is not allowed to link accounts on its own. A link needs a weight of at least 4.0, which in practice means at least two independent signal types have to agree. Without that floor, one shared office network chained 39,704 accounts into a single cluster — 98 percent of the entire dataset. With the floor in place, the exact same data produces 2 clean clusters. So sharing an IP with your flatmate does nothing on its own. Sharing an IP, a device and a payment token inside a ten-minute window is not an accident."
+  },
+  {
+    "id": "scoring_and_tiers",
+    "keywords": ["score", "scoring", "tier", "escalate", "review", "watch", "priority", "formula", "case score"],
+    "question": "How is a case scored and how are tiers assigned?",
+    "answer": "A case score is the highest risk score among its members, plus a size bonus of 0.1 times log base 2 of the member count capped at 0.5, plus a diversity bonus of 0.1 per distinct signal type capped at 0.5. A case escalates when it reaches 1.0 or above with at least 3 signal types. It goes to review at 0.5 or above, or with 2 signal types. Anything else is watchlist only. On the baseline dataset that produces 1 escalated, 45 in review and 1,581 watchlisted across 1,627 cases. The size and diversity terms exist so that a ten-account ring with five signals always outranks a single account with one."
+  },
+  {
+    "id": "speed_and_throughput",
+    "keywords": ["speed", "fast", "benchmark", "latency", "throughput", "how fast", "milliseconds", "reviews per second", "performance"],
+    "question": "How fast is TrustNet?",
+    "answer": "All of these are measured end to end over HTTP on a normal laptop with no GPU. At typical ring sizes of eight to ten accounts, one review merges in about 7.4 milliseconds, which is roughly 135 reviews per second. A sustained sequential run measured 46.7 reviews per second at a mean of 21.4 milliseconds, and the reason it is lower is that the test merges 200 reviews into one growing cluster, so cost rises as the cluster gets bigger. Batched ingest reached 56.5 reviews per second. Breaking a single call down, about 17.7 milliseconds is the engine and 3.7 milliseconds is HTTP transport. Under a 500-account stress flood into one cluster, average ingest settles at 17.7 milliseconds with zero fragmentation."
+  },
+  {
+    "id": "dataset_real_vs_synthetic",
+    "keywords": ["dataset", "kaggle", "data", "dummy", "synthetic", "real data", "fake csv", "generator"],
+    "question": "Is this real data or synthetic data?",
+    "answer": "Both, and the split is deliberate. The review text, star rating and category are real: 40,432 reviews from a public Kaggle dataset, of which 20,216 are labelled computer-generated and 20,216 original. Device fingerprint, IP block, payment instrument, account age, seller id and timestamps do not exist in that dataset at all, so those are synthesized and attached. The synthesis is tuned so ordinary reviewers share infrastructure at low rates — shared device averages 2.15 across normal accounts against 7.0 inside the injected ring. This is not a shortcut. No public review dataset carries infrastructure identifiers, because platforms never release them, and without those fields coordinated rings are structurally impossible to detect."
+  },
+  {
+    "id": "labels_and_model",
+    "keywords": ["model", "label", "weak supervision", "gradient boosting", "training", "features", "isolation forest"],
+    "question": "How is the risk model trained?",
+    "answer": "Not on a labelled fraud column, because none exists. Eight weighted labelling functions encode the ring signatures — shared device, shared payment and shared IP at weights 3.0, 3.0 and 2.5; new-account activity and near-duplicate text at 2.5 and 2.0; posting burst at 2.0; high velocity and new-seller five-star concentration at 1.5 each — and their weighted sum becomes a soft label. Inside the injected ring the soft label averages 0.7976 against 0.0834 for ordinary reviewers, a 9.6 times separation, with the baseline 99th percentile at 0.3889. A gradient boosting regressor is then fit on 19 raw features. Isolation Forest was tested and recovered only 2 of the 7 ring members, so it is kept as one input column rather than as the detector."
+  },
+  {
+    "id": "evaluation_results",
+    "keywords": ["precision", "recall", "result", "accuracy", "evaluation", "metrics", "p at 10", "test", "passing"],
+    "question": "What are the detection results?",
+    "answer": "Precision at 10 is 0.70 and recall at 10 is 1.00, meaning all 7 of 7 injected ring members are recovered inside the top ten. Ring linking rate is 1.0 and fragmentation is 0 percent — the ring comes back as exactly one case, never split. Thirteen automated tests pass, including 10 randomized held-out rings built with device, IP and payment identifiers that appear nowhere in training. The Phase 8 stress harness passed 10 of 10 rounds at an average of 7.8 milliseconds. Explainability coverage is 100 percent. One honest caveat: precision is measured against the injected-ring ground truth in this dataset, not against a real platform's fraud labels, because no public dataset provides those."
+  },
+  {
+    "id": "explainability",
+    "keywords": ["explain", "explainability", "why", "evidence", "black box", "transparent", "reason"],
+    "question": "Can a moderator understand why a case was flagged?",
+    "answer": "Yes, and that is a hard requirement rather than a nice-to-have. Every case carries a named list of the signal types that created its connections, so the moderator reads 'shared device, shared IP subnet, shared payment instrument, copy-pasted text, review burst' rather than a probability. Coverage is 100 percent — no case is escalated without a stated reason. It is also the main reason a graph was chosen over a neural embedding model. An embedding gives you a score. A connection gives you a sentence."
+  },
+  {
+    "id": "human_in_the_loop",
+    "keywords": ["human", "moderator", "feedback", "false alarm", "confirm", "dismiss", "decision", "payout"],
+    "question": "Where does the human decision sit?",
+    "answer": "TrustNet ranks and explains; it does not punish. The console shows each case with its tier, its score, its linked accounts and the named signals behind it, and a person makes the final call. The system's job is to make that call cheap: instead of opening forty separate reviews, the moderator opens one case with five stated reasons. An escalated tier is a recommendation to freeze the seller's payout and quarantine the linked reviews pending a manual check. It is never an automatic ban."
+  },
+  {
+    "id": "how_to_test",
+    "keywords": ["test", "how to test", "demo", "stress test", "button", "inject", "try it"],
+    "question": "How do I test this right now?",
+    "answer": "Open 127.0.0.1 colon 8000 in a browser. The Cases tab lists every ranked case on the left; clicking one fills the dossier on the right. Then use the two buttons in the header. Inject Member adds a single review to the known ring, and you watch the same case grow from seven to eight to nine to ten members without ever splitting. Run Ring Test adds eight reviews at once using a device, IP and payment identifier that never appeared in training, which shows detection generalises rather than memorises. Reset restores the console to its baseline state."
+  },
+  {
+    "id": "scalability",
+    "keywords": ["scale", "scalable", "scalability", "10 million", "million", "millions", "big data", "production"],
+    "question": "How would this scale to a real marketplace?",
+    "answer": "Three design properties, not three measured claims. First, linking is local: a new review only needs comparing against the entities it touches — its device, payment and IP — rather than against a global graph, so incremental cost is bounded by the size of the cluster being joined. Second, the streaming path is separate from the batch path, so a shopper gets an instant acceptance receipt while heavier linking runs behind it. Third, sharding by seller is natural, because rings attack one seller at a time. Ingest has been measured at ring sizes and under a 500-account flood. A ten-million-review load test has not been run, and will not be claimed."
+  },
+  {
+    "id": "limitations",
+    "keywords": ["limitation", "limitations", "limit", "limits", "weakness", "drawback", "fail", "wrong", "mistake", "honest", "not good at", "can't do", "cannot do"],
+    "question": "What are the limitations? What does TrustNet not do?",
+    "answer": "Four limits, stated plainly. One: it catches coordinated rings, not lone bad reviews. A single fake review with no shared infrastructure will not escalate — that is the design, not a gap. Two: the risk model is trained on weak labels built from the same signals it later evaluates, so its scores are consistent rather than independently validated against real platform fraud labels, which do not exist publicly. Three: the device, IP and payment fields are synthesized, because the source dataset omits them. Four: it judges review integrity, not product quality. There is no access to specs, return rates or shipping data, so it cannot tell you whether an item is good, only whether its reviews look coordinated."
+  },
+  {
+    "id": "seller_trust",
+    "keywords": ["seller", "buy", "trust", "should i order", "purchase", "safe", "legit", "reliable"],
+    "question": "How do I read a seller's trust status?",
+    "answer": "TrustNet reports review integrity for a seller, which is one input to a buying decision and not a verdict on the product. If a seller is linked to an escalated case, a coordinated ring is attached to them and the sensible move is to wait. If they are in review, an investigation is open — order with care. If they only appear on the watchlist, no escalation was found and ordinary purchase risk applies. If they appear in no case at all, no coordinated ring was detected around them, which still does not certify that every individual review is genuine."
+  }
+]

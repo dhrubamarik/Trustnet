@@ -1,0 +1,2299 @@
+"""
+TrustNet — Phase 6: FastAPI Service (v4 — Dynamic tier escalation)
+====================================================================
+GET  /cases, GET /cases/{id}, GET /stats, POST /ingest
+
+Run:  py -3.14 phase6_api.py
+"""
+
+import json
+import pickle
+import time
+import numpy as np
+import pandas as pd
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional
+from linker import IncrementalLinker
+
+print("Loading TrustNet data...")
+
+cases_df = pd.read_csv("cases.csv")
+scored_df = pd.read_csv("scored_features.csv")
+
+with open("graph_state.pkl", "rb") as f:
+    state = pickle.load(f)
+linker = state["linker"]
+
+# ──────────────────────────────────────────────
+# PURE PYTHON DICT (bug-free live state)
+# ──────────────────────────────────────────────
+cases_db = {}
+for _, row in cases_df.iterrows():
+    cid = str(row["case_id"])
+    cases_db[cid] = {
+        "case_id": cid,
+        "type": str(row["type"]),
+        "tier": str(row["tier"]),
+        "case_score": float(row["case_score"]),
+        "max_risk": float(row["max_risk"]),
+        "avg_risk": float(row["avg_risk"]),
+        "n_members": int(row["n_members"]),
+        "n_sellers": int(row["n_sellers"]),
+        "n_accounts": int(row["n_accounts"]),
+        "signal_diversity": int(row["signal_diversity"]),
+        "signal_types": str(row["signal_types"]),
+        "time_span_minutes": float(row["time_span_minutes"]),
+        "explanation": str(row["explanation"]),
+        "member_ids": [int(x) for x in json.loads(row["member_ids"])],
+    }
+
+def size_bonus(n):
+    return 0.0 if n < 2 else min(0.5, 0.1 * np.log2(n))
+
+def diversity_bonus(d):
+    return min(0.5, 0.1 * d)
+
+def classify_tier(n_members, diversity):
+    """Dynamic tier classification — reapplied on every update."""
+    if n_members >= 3 and diversity >= 3:
+        return "ESCALATE"
+    if n_members >= 2 or diversity >= 2:
+        return "REVIEW"
+    return "WATCH"
+
+def regenerate_explanation(c):
+    if c["type"] == "cluster":
+        return (
+            f"Coordinated activity detected: {c['n_members']} reviews "
+            f"across {c['n_sellers']} sellers from {c['n_accounts']} accounts. "
+            f"Linked via {c['signal_diversity']} signal types: {c['signal_types']}. "
+            f"Max individual risk: {c['max_risk']:.2f}. Case score: {c['case_score']:.2f}."
+        )
+    return (
+        f"Single high-risk review flagged (risk score {c['max_risk']:.2f}). "
+        f"Case score: {c['case_score']:.2f}."
+    )
+
+print(f"  Loaded {len(cases_db)} cases into memory")
+
+app = FastAPI(title="TrustNet API", version="1.3.0")
+# ---- CORS: lets the dashboard work even if opened from a Live Server ----
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,     # must stay False with "*"
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class IngestReview(BaseModel):
+    review_id: Optional[int] = None
+    text_: str = "Sample review text"
+    rating: float = 5.0
+    category: str = "Home_and_Kitchen_5"
+    seller_id: str = "SELLER-0001"
+    account_id: str = "ACCT-NEW-001"
+    account_age_hours: float = 3.0
+    device_fingerprint: str = "DEV-UNKNOWN"
+    ip_block: str = "10.0.0.0/24"
+    payment_instrument: str = "PAY-0000-0000"
+    timestamp: Optional[str] = None
+
+class CaseSummary(BaseModel):
+    case_id: str
+    tier: str
+    case_score: float
+    n_members: int
+    signal_diversity: int
+    one_line_reason: str
+
+class CaseDetail(BaseModel):
+    case_id: str
+    tier: str
+    case_score: float
+    max_risk: float
+    n_members: int
+    n_sellers: int
+    n_accounts: int
+    signal_diversity: int
+    signal_types: str
+    time_span_minutes: float
+    explanation: str
+    member_ids: list
+    member_details: list
+
+class IngestResult(BaseModel):
+    review_id: int
+    merged_into_cluster: bool
+    cluster_size: int
+    case_id: Optional[str] = None
+    tier: Optional[str] = None
+    latency_ms: float
+    message: str
+
+@app.get("/api/status")
+def root():
+    return {"service": "TrustNet", "total_cases": len(cases_db)}
+
+@app.get("/stats")
+def get_stats():
+    return {
+        "escalate": sum(1 for c in cases_db.values() if c["tier"] == "ESCALATE"),
+        "review": sum(1 for c in cases_db.values() if c["tier"] == "REVIEW"),
+        "watch": sum(1 for c in cases_db.values() if c["tier"] == "WATCH"),
+        "total": len(cases_db),
+    }
+
+@app.get("/cases", response_model=list[CaseSummary])
+def get_cases(tier: Optional[str] = None, limit: int = 100):
+    lst = list(cases_db.values())
+    if tier:
+        lst = [c for c in lst if c["tier"].upper() == tier.upper()]
+    lst.sort(key=lambda x: x["case_score"], reverse=True)
+    out = []
+    for c in lst[:limit]:
+        parts = c["explanation"].split(". ")
+        out.append(CaseSummary(
+            case_id=c["case_id"], tier=c["tier"], case_score=c["case_score"],
+            n_members=c["n_members"], signal_diversity=c["signal_diversity"],
+            one_line_reason=parts[0] + "." if parts else "No explanation.",
+        ))
+    return out
+
+@app.get("/cases/{case_id}", response_model=CaseDetail)
+def get_case_detail(case_id: str):
+    if case_id not in cases_db:
+        raise HTTPException(404, f"Case {case_id} not found")
+    c = cases_db[case_id]
+    member_details = []
+    for mid in c["member_ids"][:20]:
+        m = scored_df[scored_df["review_id"] == mid]
+        if not m.empty:
+            m = m.iloc[0]
+            member_details.append({
+                "review_id": int(mid),
+                "seller_id": str(m["seller_id"]),
+                "account_id": str(m["account_id"]),
+                "account_age_hours": float(m["account_age_hours"]),
+                "risk_score": float(m["risk_score"]),
+                "device_fingerprint": str(m["device_fingerprint"]),
+                "ip_block": str(m["ip_block"]),
+                "near_dup_score": float(m["near_dup_score"]),
+            })
+    return CaseDetail(
+        case_id=c["case_id"], tier=c["tier"], case_score=c["case_score"],
+        max_risk=c["max_risk"], n_members=c["n_members"], n_sellers=c["n_sellers"],
+        n_accounts=c["n_accounts"], signal_diversity=c["signal_diversity"],
+        signal_types=c["signal_types"], time_span_minutes=c["time_span_minutes"],
+        explanation=c["explanation"], member_ids=c["member_ids"],
+        member_details=member_details,
+    )
+
+@app.post("/ingest", response_model=IngestResult)
+def ingest_review(review: IngestReview):
+    start = time.time()
+
+    # Unique ID
+    rid = review.review_id or linker._next_id
+    while rid in linker.parent:
+        rid += 1
+
+    # ── Compute matched signal diversity BEFORE ingest ──
+    matched_signals = []
+    for col in ["device_fingerprint", "ip_block", "payment_instrument"]:
+        val = getattr(review, col)
+        if val and val in linker.signal_index[col] and len(linker.signal_index[col][val]) >= 1:
+            matched_signals.append(col)
+    new_diversity = len(matched_signals)
+
+    result = linker.ingest({
+        "review_id": rid,
+        "device_fingerprint": review.device_fingerprint,
+        "ip_block": review.ip_block,
+        "payment_instrument": review.payment_instrument,
+    })
+
+    matched_case_id = None
+
+    if result["merged"] and result["cluster_size"] >= 2:
+        member_set = set(result["cluster_members"])
+        for cid, c in cases_db.items():
+            if set(c["member_ids"]) & member_set:
+                matched_case_id = cid
+                break
+
+        if matched_case_id:
+            # ── Update existing case ──
+            c = cases_db[matched_case_id]
+            if rid not in c["member_ids"]:
+                c["member_ids"].append(rid)
+                c["n_members"] = len(c["member_ids"])
+                c["n_accounts"] = len(c["member_ids"])
+                c["signal_diversity"] = max(c["signal_diversity"], new_diversity)
+                c["case_score"] = round(c["max_risk"] + size_bonus(c["n_members"]) + diversity_bonus(c["signal_diversity"]), 4)
+                # ★ DYNAMIC TIER RECLASSIFICATION
+                c["tier"] = classify_tier(c["n_members"], c["signal_diversity"])
+                c["explanation"] = regenerate_explanation(c)
+        else:
+            # ── Create new cluster case ──
+            matched_case_id = f"CASE-LIVE-{rid}"
+            sig_names = {
+                "device_fingerprint": "shared_device",
+                "ip_block": "shared_ip",
+                "payment_instrument": "shared_payment",
+            }
+            sig_types_str = ", ".join(sig_names[s] for s in matched_signals) or "multi-signal"
+            cases_db[matched_case_id] = {
+                "case_id": matched_case_id,
+                "type": "cluster",
+                "tier": classify_tier(result["cluster_size"], new_diversity),
+                "case_score": 0.5 + size_bonus(result["cluster_size"]) + diversity_bonus(new_diversity),
+                "max_risk": 0.5,
+                "avg_risk": 0.5,
+                "n_members": result["cluster_size"],
+                "n_sellers": 1,
+                "n_accounts": result["cluster_size"],
+                "signal_diversity": new_diversity,
+                "signal_types": sig_types_str,
+                "time_span_minutes": 0,
+                "explanation": (f"Live-formed cluster: {result['cluster_size']} reviews "
+                                f"linked via {new_diversity} signal types ({sig_types_str})."),
+                "member_ids": result["cluster_members"],
+            }
+    else:
+        # ── Isolated ──
+        matched_case_id = f"CASE-LIVE-{rid}"
+        cases_db[matched_case_id] = {
+            "case_id": matched_case_id, "type": "isolated",
+            "tier": "WATCH", "case_score": 0.1, "max_risk": 0.1, "avg_risk": 0.1,
+            "n_members": 1, "n_sellers": 1, "n_accounts": 1,
+            "signal_diversity": 0, "signal_types": "none",
+            "time_span_minutes": 0,
+            "explanation": f"New review {rid} ingested. No multi-signal match.",
+            "member_ids": [rid],
+        }
+
+    latency_ms = (time.time() - start) * 1000
+    tier = cases_db[matched_case_id]["tier"]
+
+    return IngestResult(
+        review_id=rid,
+        merged_into_cluster=result["merged"],
+        cluster_size=result["cluster_size"],
+        case_id=matched_case_id,
+        tier=tier,
+        latency_ms=round(latency_ms, 2),
+        message=f"Merged into {matched_case_id} — tier={tier}, size={result['cluster_size']}, {latency_ms:.1f}ms.",
+    )
+
+# ============================================================================
+# TrustNet — console API addon (v5)
+# Adds the endpoints dashboard.html calls. Paste at the bottom of phase6_api.py,
+# immediately BEFORE  if __name__ == "__main__":
+#
+# Assumes these already exist in this module (they do in v4):
+#   app       — the FastAPI instance
+#   cases_db  — dict: case_id -> case dict
+#   linker    — IncrementalLinker instance
+#
+# === EDIT ME if your /ingest handler calls something else ====================
+INGEST_FN = (globals().get("ingest_one")
+             or globals().get("ingest_review")
+             or globals().get("process_review"))
+# ============================================================================
+
+import copy as _copy
+import csv as _csv
+import json as _json
+import os as _os
+
+BASE_DIR = _os.path.dirname(_os.path.abspath(__file__))
+from fastapi.responses import FileResponse, HTMLResponse
+
+@app.get("/landing", include_in_schema=False)
+def serve_landing():
+    import os as _os
+    from fastapi.responses import FileResponse, JSONResponse
+    p = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "landing.html")
+    if not _os.path.exists(p):
+        return JSONResponse(
+            {"error": "landing.html not found", "expected_path": p},
+            status_code=404,
+        )
+    return FileResponse(p, media_type="text/html")
+
+@app.get("/", include_in_schema=False)
+def serve_dashboard():
+    """Serve dashboard.html for the same origin as /api/* — no CORS, no file://."""
+    path = _os.path.join(BASE_DIR, "dashboard.html")
+    if not _os.path.exists(path):
+        return HTMLResponse(
+            "<h1>dashboard.html not found</h1>"
+            "<p>Expected at: <code>%s</code></p>" % path,
+            status_code=404,
+        )
+    return FileResponse(path, media_type="text/html")
+
+SCORE_CEILING = 2.0   # max theoretical case_score: 1.0 member + 0.5 size + 0.5 diversity
+
+# ---- entity + text index ---------------------------------------------------
+REVIEW_INDEX = {}
+
+
+def _load_index():
+    candidates = ["enriched_reviews.csv", "scored_features.csv", "features.csv"]
+    for name in candidates:
+        path = _os.path.join(BASE_DIR, name)
+        if not _os.path.exists(path):
+            continue
+        try:
+            with open(path, newline="", encoding="utf-8") as fh:
+                for row in _csv.DictReader(fh):
+                    rid = row.get("review_id")
+                    if not rid or rid in REVIEW_INDEX:
+                        continue
+                    REVIEW_INDEX[rid] = {
+                        "text": (row.get("text_") or row.get("review_text") or "")[:300],
+                        "rating": float(row.get("rating") or 0),
+                        "seller_id": row.get("seller_id") or "",
+                        "account_id": row.get("account_id") or "",
+                        "device": row.get("device_fingerprint") or "",
+                        "ip": row.get("ip_block") or "",
+                        "payment": row.get("payment_instrument") or "",
+                    }
+        except Exception as exc:
+            print("[console-api] index load failed:", name, exc)
+
+
+_load_index()
+
+# ---- baseline snapshot (schema-independent reset) --------------------------
+_BASELINE_CASES = _copy.deepcopy(cases_db)
+try:
+    _BASELINE_LINKER = _copy.deepcopy(linker)
+except Exception:
+    _BASELINE_LINKER = None
+
+_last_latency_ms = None
+
+
+# ---- helpers ---------------------------------------------------------------
+SIGNAL_LABEL = {
+    "device": "Shared device hardware",
+    "device_fingerprint": "Shared device hardware",
+    "ip": "Coordinated IP subnet",
+    "ip_block": "Coordinated IP subnet",
+    "subnet": "Coordinated IP subnet",
+    "payment": "Shared payment instrument",
+    "payment_instrument": "Shared payment instrument",
+    "text": "Stylistic / content collusion",
+    "near_dup": "Stylistic / content collusion",
+    "burst": "High-velocity temporal burst",
+    "temporal": "High-velocity temporal burst",
+    "account": "Fresh-account shill pattern",
+    "velocity": "Multi-day volume anomaly",
+}
+
+RECOMMENDED = {
+    "Escalate": "Freeze seller payouts, unpublish the linked reviews, and open a manual investigation.",
+    "Review": "Queue for analyst review. Do not act until a second signal type confirms.",
+    "Watch": "Monitor only. Escalate if the case grows or gains a new signal type.",
+}
+
+
+def _norm_tier(t):
+    t = str(t or "").upper()
+    if t.startswith("ESC"):
+        return "Escalate"
+    if t.startswith("REV"):
+        return "Review"
+    return "Watch"
+
+
+def _members(case):
+    for key in ("_members", "members", "review_ids"):
+        val = case.get(key)
+        if isinstance(val, (list, tuple, set)):
+            return [str(x) for x in val]
+    return []
+
+
+def _signals(case):
+    for key in ("signals", "signal_types", "shared_signals"):
+        val = case.get(key)
+        if isinstance(val, (list, tuple, set)):
+            return [str(x) for x in val]
+    return []
+
+
+def _score_100(raw):
+    return max(0, min(100, int(round(float(raw) / SCORE_CEILING * 100))))
+
+
+def _build_graph(members):
+    nodes, links = {}, set()
+
+    for rid in members:
+        info = REVIEW_INDEX.get(rid, {})
+        seller = info.get("seller_id") or "unknown"
+        account = info.get("account_id") or ("acct-" + rid)
+
+        nodes.setdefault("s:" + seller, {"id": "s:" + seller, "type": "seller"})
+        nodes.setdefault("a:" + account, {"id": "a:" + account, "type": "account"})
+        nodes.setdefault("r:" + rid, {"id": "r:" + rid, "type": "review"})
+
+        links.add(("a:" + account, "s:" + seller))
+        links.add(("r:" + rid, "a:" + account))
+
+        dev = info.get("device")
+        if dev:
+            key = "d:" + dev
+            nodes.setdefault(key, {"id": key, "type": "device_fingerprint"})
+            links.add(("r:" + rid, key))
+
+        pay = info.get("payment")
+        if pay:
+            key = "p:" + pay
+            nodes.setdefault(key, {"id": key, "type": "payment_instrument"})
+            links.add(("r:" + rid, key))
+
+        ip = info.get("ip")
+        if ip:
+            key = "i:" + ip
+            nodes.setdefault(key, {"id": key, "type": "subnet"})
+            links.add(("r:" + rid, key))
+
+    return {
+        "nodes": list(nodes.values()),
+        "links": [{"source": a, "target": b} for a, b in sorted(links)],
+    }
+
+
+def _case_to_api(case_id, case):
+    members = _members(case)
+    signals = _signals(case)
+    tier = _norm_tier(case.get("tier") or case.get("severity_tier"))
+    raw = float(case.get("case_score") or 0.0)
+
+    sellers, accounts = [], set()
+    review_items = []
+    for rid in members:
+        info = REVIEW_INDEX.get(rid, {})
+        if info.get("seller_id") and info["seller_id"] not in sellers:
+            sellers.append(info["seller_id"])
+        if info.get("account_id"):
+            accounts.add(info["account_id"])
+        review_items.append({
+            "author": info.get("account_id") or rid,
+            "seller": info.get("seller_id") or "—",
+            "rating": info.get("rating") or 0,
+            "text": info.get("text") or "(no text captured)",
+        })
+
+    labels = [SIGNAL_LABEL.get(s.lower(), s.replace("_", " ").title()) for s in signals]
+
+    stored = case.get("explanation")
+    if isinstance(stored, str) and stored.strip():
+        summary = stored.strip()
+    else:
+        summary = (
+            "%d reviews are linked by %d independent signal types (%s). "
+            "They resolve to a single coordinated case rather than %d separate flags."
+            % (len(members), len(labels), ", ".join(labels) if labels else "entity overlap", len(members))
+        )
+
+    bullets = case.get("explanation_bullet_points")
+    if not isinstance(bullets, list) or not bullets:
+        bullets = ["%s — shared across %d linked accounts." % (lab, len(members)) for lab in labels]
+        bullets.append("%d reviews resolved to one case (fragmentation: 0)." % len(members))
+
+    return {
+        "case_id": case_id,
+        "severity_tier": tier,
+        "case_score": round(raw, 3),
+        "case_score_100": _score_100(raw),
+        "account_count": len(accounts) or len(members),
+        "review_count": len(members),
+        "sellers_involved": sellers,
+        "shared_signals": labels,
+        "signal_diversity": int(case.get("signal_diversity") or len(signals)),
+        "recommended_action": RECOMMENDED[tier],
+        "explanation_summary": summary,
+        "explanation_bullet_points": bullets,
+        "graph_data": _build_graph(members),
+        "review_items": review_items[:12],
+    }
+
+
+def _require_ingest():
+    if INGEST_FN is None:
+        raise RuntimeError(
+            "console-api: INGEST_FN is None — set it to the function your "
+            "POST /ingest handler calls (e.g. INGEST_FN = ingest_review)."
+        )
+    return INGEST_FN
+
+
+# ---- endpoints -------------------------------------------------------------
+@app.get("/api/overview")
+def api_overview():
+    counts = {"Escalate": 0, "Review": 0, "Watch": 0}
+    for case in cases_db.values():
+        counts[_norm_tier(case.get("tier") or case.get("severity_tier"))] += 1
+    return {
+        "tier_counts": counts,
+        "total_cases": len(cases_db),
+        "indexed_reviews": len(REVIEW_INDEX),
+        "last_latency_ms": _last_latency_ms,
+    }
+
+
+@app.get("/api/cases")
+def api_cases(tier: str = None, limit: int = 400):
+    rows = [_case_to_api(cid, case) for cid, case in cases_db.items()]
+    if tier:
+        want = _norm_tier(tier)
+        rows = [r for r in rows if r["severity_tier"] == want]
+    rows.sort(key=lambda r: (r["case_score"], r["review_count"]), reverse=True)
+    return {"cases": rows[:limit], "total": len(rows)}
+
+
+@app.get("/api/reviews")
+def api_reviews(limit: int = 80, flagged_only: bool = False):
+    rows = list(REVIEW_INDEX.items())[:20000]
+    out = []
+    for rid, info in rows:
+        score = 0
+        for cid, case in cases_db.items():
+            if rid in _members(case):
+                score = _score_100(case.get("case_score") or 0)
+                break
+        if flagged_only and score < 50:
+            continue
+        out.append({
+            "review_id": rid,
+            "risk_score": score,
+            "seller_id": info.get("seller_id") or "—",
+            "account_id": info.get("account_id") or "—",
+            "rating": info.get("rating") or 0,
+            "review_text": info.get("text") or "",
+            "triggered_rules": [],
+        })
+        if len(out) >= limit:
+            break
+    return {"reviews": out}
+
+
+@app.post("/api/reset")
+def api_reset():
+    """Restore the in-memory baseline captured at startup. No restart needed."""
+    global linker
+    cases_db.clear()
+    cases_db.update(_copy.deepcopy(_BASELINE_CASES))
+    if _BASELINE_LINKER is not None:
+        try:
+            linker = _copy.deepcopy(_BASELINE_LINKER)
+        except Exception:
+            pass
+    return {"ok": True, "cases": len(cases_db)}
+
+
+@app.post("/api/inject-member")
+def api_inject_member():
+    """Add ONE review matching the Phase-0 ring fingerprint -> grows CASE-0000 by 1."""
+    global _last_latency_ms
+    import time as _time
+    t0 = _time.perf_counter()
+
+    payload = {
+        "seller_id": "SEL_003",
+        "account_id": "ACC-RING-LIVE-%d" % (len(REVIEW_INDEX) + 1),
+        "rating": 5,
+        "review_text": "AMAZING 10/10 MUST BUY! Best seller ever! Incredible quality, flawless product!",
+        "device_fingerprint": "DEV-A7F3E9C1-FAKE-RING",
+        "ip_block": "198.51.100.0/24",
+        "payment_instrument": "PAY-RING-4829",
+        "account_age_hours": 3.4,
+    }
+
+    result = _require_ingest()(payload)
+    _last_latency_ms = round((_time.perf_counter() - t0) * 1000, 1)
+
+    case_id = (result or {}).get("assigned_case_id") or (result or {}).get("case_id")
+    case = cases_db.get(case_id) if case_id else None
+
+    return {
+        "case_id": case_id,
+        "member_count": len(_members(case)) if case else 0,
+        "tier": _norm_tier(case.get("tier")) if case else "Watch",
+        "latency_ms": _last_latency_ms,
+    }
+
+
+@app.post("/api/stress-test/inject")
+def api_stress_test_inject(body: dict = None):
+    """Inject an 8-account ring in one shot (the dramatic demo)."""
+    global _last_latency_ms
+    body = body or {}
+    ingest = _require_ingest()
+    import time as _time
+
+    t0 = _time.perf_counter()
+    device = body.get("shared_device", "DEV-SYNDICATE-APEX")
+    payment = body.get("shared_payment", "PAY-SYNDICATE-APEX")
+    seller = body.get("seller_id", "SEL_003")
+    text = "AMAZING 10/10 MUST BUY! Best seller ever!"
+
+    last = None
+    for i in range(8):
+        last = ingest({
+            "seller_id": seller,
+            "account_id": "ACC-APEX-%02d" % i,
+            "rating": 5,
+            "review_text": text,
+            "device_fingerprint": device,
+            "ip_block": "203.0.113.0/24",
+            "payment_instrument": payment,
+            "account_age_hours": 2.0 + i * 0.3,
+        })
+
+    _last_latency_ms = round((_time.perf_counter() - t0) * 1000, 1)
+    case_id = (last or {}).get("assigned_case_id") or (last or {}).get("case_id")
+    case = cases_db.get(case_id) if case_id else None
+    return {
+        "case_id": case_id,
+        "member_count": len(_members(case)) if case else 0,
+        "latency_ms": _last_latency_ms,
+    }
+
+def _as_result_dict(obj):
+    """Normalise an ingest return value to a plain dict.
+    Handles dict, pydantic v1/v2 models, plain objects, None."""
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        return obj
+    for meth in ("model_dump", "dict"):
+        fn = getattr(obj, meth, None)
+        if callable(fn):
+            try:
+                d = fn()
+                if isinstance(d, dict):
+                    return d
+            except Exception:
+                pass
+    try:
+        return {k: v for k, v in vars(obj).items() if not k.startswith("_")}
+    except Exception:
+        return {"value": obj}
+
+@app.post("/api/custom/review")
+def api_custom_review(payload: dict):
+    global _last_latency_ms
+    import time as _time
+    t0 = _time.perf_counter()
+
+    result = _require_ingest()(payload)
+    result = _as_result_dict(result)
+    _last_latency_ms = round((_time.perf_counter() - t0) * 1000, 1)
+
+    case_id = (result or {}).get("assigned_case_id") or (result or {}).get("case_id")
+    case = cases_db.get(case_id) if case_id else None
+    raw = float((result or {}).get("risk_score") or 0.0)
+
+    return {
+        "scored_review": {
+            "review_id": (result or {}).get("review_id") or (result or {}).get("rid"),
+            "risk_score": _score_100(raw),
+        },
+        "assigned_case_id": case_id,
+        "latency_ms": _last_latency_ms,
+    }
+
+
+@app.post("/api/custom/ring")
+def api_custom_ring(payload: dict):
+    global _last_latency_ms
+    ingest = _require_ingest()
+    import time as _time
+
+    n = int(payload.get("num_accounts") or 6)
+    n = max(3, min(15, n))
+    device = payload.get("shared_device") or "DEV-CUSTOM-RING"
+    payment = payload.get("shared_payment") or "PAY-CUSTOM-RING"
+    seller = payload.get("seller_id") or "SEL_003"
+    text = payload.get("review_text") or "AMAZING 10/10 MUST BUY!"
+
+    t0 = _time.perf_counter()
+    last = None
+    for i in range(n):
+        last = ingest({
+            "seller_id": seller,
+            "account_id": "ACC-CUSTOM-%02d-%d" % (i, int(_time.time() * 1000) % 10000),
+            "rating": 5,
+            "review_text": text,
+            "device_fingerprint": device,
+            "ip_block": "192.0.2.0/24",
+            "payment_instrument": payment,
+            "account_age_hours": 1.5 + i * 0.2,
+        })
+
+    _last_latency_ms = round((_time.perf_counter() - t0) * 1000, 1)
+    case_id = (last or {}).get("assigned_case_id") or (last or {}).get("case_id")
+    case = cases_db.get(case_id) if case_id else None
+    raw = float(case.get("case_score") or 0.0) if case else 0.0
+
+    return {
+        "case_id": case_id,
+        "member_count": len(_members(case)) if case else 0,
+        "case_score_100": _score_100(raw),
+        "latency_ms": _last_latency_ms,
+    }
+
+# ============================================================================
+# console-api v5.1 — tolerant member/signal extraction + CSV fallback
+# ============================================================================
+
+def _as_result_dict(obj):
+    """dict / pydantic model / plain object / None  ->  plain dict"""
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        return obj
+    for meth in ("model_dump", "dict"):
+        fn = getattr(obj, meth, None)
+        if callable(fn):
+            try:
+                d = fn()
+                if isinstance(d, dict):
+                    return d
+            except Exception:
+                pass
+    try:
+        return {k: v for k, v in vars(obj).items() if not k.startswith("_")}
+    except Exception:
+        return {"value": obj}
+
+
+_INGEST_SHIM_DONE = False
+
+def _install_ingest_shim():
+    """Give IngestResult a .get() so existing code works unchanged."""
+    global _INGEST_SHIM_DONE
+    if _INGEST_SHIM_DONE:
+        return
+    _INGEST_SHIM_DONE = True
+    ir = globals().get("IngestResult")
+    if ir is None:
+        print("[console-api] IngestResult not found - shim skipped")
+        return
+    try:
+        ir.get = lambda self, k, d=None: _as_result_dict(self).get(k, d)
+        ir.__getitem__ = lambda self, k: _as_result_dict(self)[k]
+        ir.__contains__ = lambda self, k: k in _as_result_dict(self)
+        print("[console-api] IngestResult shim installed")
+    except Exception as e:
+        print(f"[console-api] IngestResult shim FAILED: {type(e).__name__}: {e}")
+
+_install_ingest_shim()
+
+def _as_list(val):
+    """Coerce list | JSON string | comma string | scalar into list[str]."""
+    if val is None:
+        return []
+    if isinstance(val, (list, tuple, set)):
+        return [str(x) for x in val if str(x).strip()]
+    if isinstance(val, str):
+        s = val.strip()
+        if not s or s.lower() in ("nan", "none", "null", "[]"):
+            return []
+        if s[0] in "[(":
+            try:
+                parsed = _json.loads(s.replace("'", '"'))
+                if isinstance(parsed, (list, tuple)):
+                    return [str(x) for x in parsed]
+            except Exception:
+                pass
+            s = s[1:-1]
+        return [p.strip().strip("'\"") for p in s.split(",") if p.strip()]
+    if isinstance(val, (int, float)):
+        return [str(int(val))]
+    return [str(val)]
+
+
+
+CSV_CASES = {}
+
+
+def _load_cases_csv():
+    path = _os.path.join(BASE_DIR, "cases.csv")
+    if not _os.path.exists(path):
+        print("[console-api] cases.csv missing — falling back to in-memory only")
+        return
+    try:
+        with open(path, newline="", encoding="utf-8") as fh:
+            for row in _csv.DictReader(fh):
+                cid = row.get("case_id")
+                if cid:
+                    CSV_CASES[str(cid)] = row
+        print("[console-api] cases.csv indexed:", len(CSV_CASES))
+    except Exception as exc:
+        print("[console-api] cases.csv load failed:", exc)
+
+
+_load_cases_csv()
+
+_MEMBER_KEYS = ("_members", "members", "member_ids", "review_ids", "review_id_list",
+                "members_json", "member_list", "reviews")
+_SIGNAL_KEYS = ("signals", "signal_types", "shared_signals", "signals_json",
+                "signal_json", "triggered_signals", "triggered_rules")
+
+
+def _members(case):
+    if not isinstance(case, dict):
+        return []
+    for k in _MEMBER_KEYS:
+        vals = _as_list(case.get(k))
+        if vals:
+            return vals
+    cid = case.get("case_id")
+    if cid:
+        row = CSV_CASES.get(str(cid)) or {}
+        for k in _MEMBER_KEYS:
+            vals = _as_list(row.get(k))
+            if vals:
+                return vals
+    return []
+
+
+def _signals(case):
+    if not isinstance(case, dict):
+        return []
+    for k in _SIGNAL_KEYS:
+        vals = _as_list(case.get(k))
+        if vals:
+            return vals
+    cid = case.get("case_id")
+    if cid:
+        row = CSV_CASES.get(str(cid)) or {}
+        for k in _SIGNAL_KEYS:
+            vals = _as_list(row.get(k))
+            if vals:
+                return vals
+    return []
+
+
+# make case_id available on every in-memory case so the CSV lookup can fire
+for _cid, _case in list(cases_db.items()):
+    if isinstance(_case, dict):
+        _case.setdefault("case_id", _cid)
+
+
+@app.get("/api/debug/case/{case_id}")
+def api_debug_case(case_id: str):
+    """Inspect the raw shape of one case. Remove before submission if you like."""
+    case = cases_db.get(case_id)
+    row = CSV_CASES.get(case_id) or {}
+    return {
+        "in_memory_keys": sorted(case.keys()) if isinstance(case, dict) else None,
+        "in_memory": case if isinstance(case, dict) else None,
+        "csv_keys": sorted(row.keys()),
+        "csv_row": row or None,
+        "resolved_members": _members(case or {}),
+        "resolved_signals": _signals(case or {}),
+    }
+
+# ============================================================================
+# console-api v5.2 — ingest bridge
+# Fixes Inject Member / Run Ring Test by locating the real POST /ingest handler
+# instead of guessing its name, and by awaiting it / building its model arg.
+# ============================================================================
+
+import inspect as _inspect
+import time as _time
+
+
+# --- 1. drop the v5 routes. FastAPI matches first-registered-wins, so the
+#        broken definitions must be removed before re-registering. -----------
+_BROKEN_PATHS = {
+    "/api/inject-member",
+    "/api/stress-test/inject",
+    "/api/custom/review",
+    "/api/custom/ring",
+}
+app.router.routes = [r for r in app.router.routes
+                     if getattr(r, "path", None) not in _BROKEN_PATHS]
+
+
+# --- 2. signal labels: substring matching, so "near_dup_text" and
+#        "shared_device" resolve to the same wording the UI expects ---------
+class _SignalLabels(dict):
+    _RULES = (
+        ("device",   "Shared device hardware"),
+        ("payment",  "Shared payment instrument"),
+        ("ip",       "Coordinated IP subnet"),
+        ("subnet",   "Coordinated IP subnet"),
+        ("dup",      "Stylistic / content collusion"),
+        ("text",     "Stylistic / content collusion"),
+        ("styl",     "Stylistic / content collusion"),
+        ("collus",   "Stylistic / content collusion"),
+        ("burst",    "High-velocity temporal burst"),
+        ("temporal", "High-velocity temporal burst"),
+        ("account",  "Fresh-account shill pattern"),
+        ("shill",    "Fresh-account shill pattern"),
+        ("velocity", "Multi-day volume anomaly"),
+        ("volume",   "Multi-day volume anomaly"),
+    )
+
+    def get(self, key, default=None):
+        s = str(key).lower()
+        for token, label in self._RULES:
+            if token in s:
+                return label
+        return str(key).replace("_", " ").title()
+
+
+SIGNAL_LABEL = _SignalLabels()
+
+
+# --- 3. locate the real ingest route ---------------------------------------
+def _find_ingest_route():
+    preferred, fallback = None, None
+    for route in app.router.routes:
+        path = getattr(route, "path", "") or ""
+        methods = getattr(route, "methods", None) or set()
+        if "POST" not in methods:
+            continue
+        if path.rstrip("/") == "/ingest":
+            preferred = route
+            break
+        if path.rstrip("/").endswith("ingest") and fallback is None:
+            fallback = route
+    return preferred or fallback
+
+
+def _build_call_arg(fn, payload):
+    params = [p for p in _inspect.signature(fn).parameters.values()
+              if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+    if not params:
+        return _inspect._empty
+
+    ann = params[0].annotation
+    if isinstance(ann, str):
+        ann = globals().get(ann)
+    if ann in (None, _inspect._empty, dict) or not isinstance(ann, type):
+        return payload
+
+    try:
+        return ann(**payload)          # pydantic v1 or v2 model
+    except Exception as exc:
+        raise RuntimeError(
+            "ingest rejected payload for %s -> %s" % (ann.__name__, exc)
+        )
+
+
+async def _invoke_ingest(payload):
+    route = _find_ingest_route()
+    if route is None:
+        raise RuntimeError("no POST /ingest route is registered on this app")
+
+    fn = route.endpoint
+    arg = _build_call_arg(fn, payload)
+
+    result = fn() if arg is _inspect._empty else fn(arg)
+    if _inspect.isawaitable(result):
+        result = await result
+    return result
+
+
+# --- 4. identify which case grew, without trusting the return shape --------
+def _case_snapshot():
+    return {cid: len(_members(c)) for cid, c in cases_db.items()}
+
+
+def _resolve_case(result, before):
+    rid = None
+    if isinstance(result, dict):
+        for key in ("review_id", "rid"):
+            if result.get(key) is not None:
+                rid = str(result[key])
+                break
+        if rid is None:
+            sr = result.get("scored_review")
+            if isinstance(sr, dict) and sr.get("review_id") is not None:
+                rid = str(sr["review_id"])
+
+    if rid:
+        for cid, c in cases_db.items():
+            if rid in _members(c):
+                return cid
+
+    grown = []
+    for cid, c in cases_db.items():
+        delta = len(_members(c)) - before.get(cid, 0)
+        if delta > 0:
+            grown.append((delta, float(c.get("case_score") or 0), cid))
+    if grown:
+        grown.sort(reverse=True)
+        return grown[0][2]
+
+    if isinstance(result, dict):
+        cid = result.get("assigned_case_id") or result.get("case_id")
+        if cid and cid in cases_db:
+            return cid
+    return None
+
+
+_LIVE_SEQ = [0]
+
+
+def _next_account(tag):
+    _LIVE_SEQ[0] += 1
+    return "ACC-LIVE-%s-%03d" % (tag, _LIVE_SEQ[0])
+
+
+def _ring_payload(account, seller, text, device, ip, payment, age):
+    return {
+        "seller_id": seller,
+        "account_id": account,
+        "rating": 5,
+        "review_text": text,
+        "device_fingerprint": device,
+        "ip_block": ip,
+        "payment_instrument": payment,
+        "account_age_hours": age,
+    }
+
+
+# --- 5. replacement endpoints ----------------------------------------------
+@app.post("/api/inject-member")
+async def api_inject_member():
+    global _last_latency_ms
+
+    payload = _ring_payload(
+        _next_account("RING"), "SEL_003",
+        "AMAZING 10/10 MUST BUY! Best seller ever! Incredible quality, flawless product!",
+        "DEV-A7F3E9C1-FAKE-RING", "198.51.100.0/24", "PAY-RING-4829", 3.4,
+    )
+
+    before = _case_snapshot()
+    t0 = _time.perf_counter()
+    try:
+        result = await _invoke_ingest(payload)
+    except Exception as exc:
+        return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+
+    _last_latency_ms = round((_time.perf_counter() - t0) * 1000, 1)
+    cid = _resolve_case(result, before)
+    case = cases_db.get(cid) if cid else None
+
+    return {
+        "ok": True,
+        "case_id": cid,
+        "member_count": len(_members(case)) if case else 0,
+        "tier": _norm_tier(case.get("tier")) if case else "Watch",
+        "latency_ms": _last_latency_ms,
+    }
+
+
+@app.post("/api/stress-test/inject")
+async def api_stress_test_inject(body: dict = None):
+    global _last_latency_ms
+    body = body or {}
+    seller = body.get("seller_id", "SEL_003")
+    device = body.get("shared_device", "DEV-SYNDICATE-APEX")
+    payment = body.get("shared_payment", "PAY-SYNDICATE-APEX")
+    text = "AMAZING 10/10 MUST BUY! Best seller ever!"
+
+    before = _case_snapshot()
+    t0 = _time.perf_counter()
+    result = None
+    try:
+        for i in range(8):
+            result = await _invoke_ingest(
+                _ring_payload(_next_account("APEX"), seller, text,
+                              device, "203.0.113.0/24", payment, 2.0 + i * 0.3)
+            )
+    except Exception as exc:
+        return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+
+    _last_latency_ms = round((_time.perf_counter() - t0) * 1000, 1)
+    cid = _resolve_case(result, before)
+    case = cases_db.get(cid) if cid else None
+
+    return {
+        "ok": True,
+        "case_id": cid,
+        "member_count": len(_members(case)) if case else 0,
+        "latency_ms": _last_latency_ms,
+    }
+
+
+@app.post("/api/custom/ring")
+async def api_custom_ring(payload: dict):
+    global _last_latency_ms
+    n = max(3, min(15, int(payload.get("num_accounts") or 6)))
+    seller = payload.get("seller_id") or "SEL_003"
+    device = payload.get("shared_device") or "DEV-CUSTOM-RING"
+    payment = payload.get("shared_payment") or "PAY-CUSTOM-RING"
+    text = payload.get("review_text") or "AMAZING 10/10 MUST BUY!"
+
+    before = _case_snapshot()
+    t0 = _time.perf_counter()
+    result = None
+    try:
+        for i in range(n):
+            result = await _invoke_ingest(
+                _ring_payload(_next_account("CUSTOM"), seller, text,
+                              device, "192.0.2.0/24", payment, 1.5 + i * 0.2)
+            )
+    except Exception as exc:
+        return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+
+    _last_latency_ms = round((_time.perf_counter() - t0) * 1000, 1)
+    cid = _resolve_case(result, before)
+    case = cases_db.get(cid) if cid else None
+    raw = float(case.get("case_score") or 0.0) if case else 0.0
+
+    return {
+        "ok": True,
+        "case_id": cid,
+        "member_count": len(_members(case)) if case else 0,
+        "case_score_100": _score_100(raw),
+        "latency_ms": _last_latency_ms,
+    }
+
+
+@app.post("/api/custom/review")
+async def api_custom_review(payload: dict):
+    global _last_latency_ms
+
+    before = _case_snapshot()
+    t0 = _time.perf_counter()
+    try:
+        result = await _invoke_ingest(payload)
+    except Exception as exc:
+        return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+
+    _last_latency_ms = round((_time.perf_counter() - t0) * 1000, 1)
+    cid = _resolve_case(result, before)
+    case = cases_db.get(cid) if cid else None
+
+    raw = None
+    if isinstance(result, dict):
+        raw = result.get("risk_score")
+    if raw is None and case is not None:
+        raw = case.get("max_risk")
+    raw = float(raw or 0.0)
+
+    rid = None
+    if isinstance(result, dict):
+        rid = result.get("review_id") or result.get("rid")
+
+    return {
+        "ok": True,
+        "scored_review": {"review_id": rid, "risk_score": _score_100(raw)},
+        "assigned_case_id": cid,
+        "latency_ms": _last_latency_ms,
+    }
+
+
+@app.get("/api/debug/ingest-route")
+def api_debug_ingest_route():
+    """Tells you which handler the bridge found and what it expects."""
+    route = _find_ingest_route()
+    if route is None:
+        return {
+            "found": False,
+            "post_routes": [getattr(r, "path", "")
+                            for r in app.router.routes
+                            if "POST" in (getattr(r, "methods", None) or set())],
+        }
+
+    fn = route.endpoint
+    params, schema = [], None
+    for p in _inspect.signature(fn).parameters.values():
+        params.append({"name": p.name,
+                       "annotation": str(p.annotation),
+                       "default": str(p.default)})
+
+    first = next(iter(_inspect.signature(fn).parameters.values()), None)
+    ann = getattr(first, "annotation", None) if first else None
+    try:
+        if hasattr(ann, "model_json_schema"):
+            schema = ann.model_json_schema()
+        elif hasattr(ann, "schema"):
+            schema = ann.schema()
+    except Exception:
+        pass
+
+    return {
+        "found": True,
+        "path": route.path,
+        "endpoint": fn.__name__,
+        "is_async": _inspect.iscoroutinefunction(fn),
+        "params": params,
+        "request_schema": schema,
+    }
+
+# ============================================================================
+# console-api v5.3 — index live reviews, derive signals, truthful summaries
+# ============================================================================
+
+_V52_INVOKE = _invoke_ingest
+
+
+def _extract_rid(result):
+    if isinstance(result, dict):
+        for k in ("review_id", "rid"):
+            if result.get(k) is not None:
+                return str(result[k])
+        sr = result.get("scored_review")
+        if isinstance(sr, dict) and sr.get("review_id") is not None:
+            return str(sr["review_id"])
+    return None
+
+
+def _index_live(payload, result):
+    """Record a runtime-ingested review so sellers / text / graph resolve."""
+    rid = _extract_rid(result)
+    if rid is None:                      # handler returned no id — find the orphan
+        for _c in cases_db.values():
+            for _m in _members(_c):
+                if _m not in REVIEW_INDEX:
+                    rid = _m
+                    break
+            if rid:
+                break
+    if rid is None or rid in REVIEW_INDEX:
+        return rid
+    REVIEW_INDEX[rid] = {
+        "text": (payload.get("review_text") or payload.get("text_")
+                 or payload.get("text") or "")[:300],
+        "rating": float(payload.get("rating") or 0),
+        "seller_id": payload.get("seller_id") or "",
+        "account_id": payload.get("account_id") or "",
+        "device": payload.get("device_fingerprint") or "",
+        "ip": payload.get("ip_block") or "",
+        "payment": payload.get("payment_instrument") or "",
+    }
+    return rid
+
+
+async def _invoke_ingest(payload):
+    result = await _V52_INVOKE(payload)
+    try:
+        _index_live(payload, result)
+    except Exception as exc:
+        print("[console-api] live index failed:", exc)
+    return result
+
+
+def _derive_signals(members):
+    """Fallback: compute shared entities directly when the case carries none."""
+    infos = [REVIEW_INDEX[m] for m in members if m in REVIEW_INDEX]
+    if len(infos) < 2:
+        return []
+
+    def shared(key):
+        vals = [i.get(key) for i in infos if i.get(key)]
+        return len(vals) >= 2 and len(set(vals)) < len(vals)
+
+    out = []
+    if shared("device"):
+        out.append("shared_device")
+    if shared("ip"):
+        out.append("shared_ip")
+    if shared("payment"):
+        out.append("shared_payment")
+    texts = [i["text"].strip().lower() for i in infos if i.get("text")]
+    if len(texts) >= 2 and len(set(texts)) < len(texts):
+        out.append("near_dup_text")
+    return out
+
+
+def _signals(case):
+    if not isinstance(case, dict):
+        return []
+    for k in _SIGNAL_KEYS:
+        vals = _as_list(case.get(k))
+        if vals:
+            return vals
+    cid = case.get("case_id")
+    if cid:
+        row = CSV_CASES.get(str(cid)) or {}
+        for k in _SIGNAL_KEYS:
+            vals = _as_list(row.get(k))
+            if vals:
+                return vals
+    return _derive_signals(_members(case))
+
+
+def _case_to_api(case_id, case):
+    members = _members(case)
+    raw = float(case.get("case_score") or 0.0)
+    max_risk = float(case.get("max_risk") or 0.0)
+    tier = _norm_tier(case.get("tier") or case.get("severity_tier"))
+
+    labels, seen = [], set()
+    for s in _signals(case):
+        lab = SIGNAL_LABEL.get(str(s).lower(), str(s).replace("_", " ").title())
+        if lab not in seen:
+            seen.add(lab)
+            labels.append(lab)
+
+    sellers, accounts, review_items = [], set(), []
+    for rid in members:
+        info = REVIEW_INDEX.get(rid, {})
+        sid = info.get("seller_id") or ""
+        aid = info.get("account_id") or ""
+        if sid and sid not in sellers:
+            sellers.append(sid)
+        if aid:
+            accounts.add(aid)
+        review_items.append({
+            "author": aid or rid,
+            "seller": sid or "—",
+            "rating": info.get("rating") or 0,
+            "text": info.get("text") or "(no text captured)",
+        })
+
+    n_acc = len(accounts) or len(members)
+    span = case.get("time_span_minutes")
+
+    if len(members) >= 2 and labels:
+        summary = ("%d reviews across %d seller%s from %d account%s are linked by "
+                   "%d independent signal type%s (%s)."
+                   % (len(members), len(sellers), "" if len(sellers) == 1 else "s",
+                      n_acc, "" if n_acc == 1 else "s",
+                      len(labels), "" if len(labels) == 1 else "s",
+                      ", ".join(labels).lower()))
+        try:
+            if span and float(span) > 0:
+                summary += " All activity falls inside a %.1f-minute window." % float(span)
+        except (TypeError, ValueError):
+            pass
+        summary += " Max individual risk %.2f; case score %.2f." % (max_risk, raw)
+        bullets = ["%s — shared across the linked reviews." % l for l in labels]
+        bullets.append("%d reviews resolved into a single case; fragmentation 0."
+                       % len(members))
+    else:
+        stored = case.get("explanation")
+        summary = (stored.strip() if isinstance(stored, str) and stored.strip()
+                   else "Single isolated review. No shared device, IP, payment or text match.")
+        bullets = [
+            "No shared entity with any other review.",
+            "Risk comes from review content and account signals, not coordination.",
+        ]
+
+    return {
+        "case_id": case_id,
+        "severity_tier": tier,
+        "case_score": round(raw, 3),
+        "case_score_100": _score_100(raw),
+        "account_count": n_acc,
+        "review_count": len(members),
+        "sellers_involved": sellers,
+        "shared_signals": labels,
+        "signal_diversity": len(labels),
+        "recommended_action": RECOMMENDED[tier],
+        "explanation_summary": summary,
+        "explanation_bullet_points": bullets,
+        "graph_data": _build_graph(members),
+        "review_items": review_items[:12],
+    }
+
+# ============================================================================
+# console-api v5.4 — O(1) case resolution + real per-review scores
+# ============================================================================
+
+app.router.routes = [r for r in app.router.routes
+                     if getattr(r, "path", None) not in {"/api/reviews", "/api/reset"}]
+
+
+# --- 1. cheap member counting (n_members is already an int on every case) ----
+def _member_count(case):
+    if not isinstance(case, dict):
+        return 0
+    try:
+        return int(case.get("n_members"))
+    except (TypeError, ValueError):
+        return len(_members(case))
+
+
+def _case_snapshot():
+    return {cid: _member_count(c) for cid, c in cases_db.items()}
+
+
+MEMBER_TO_CASE = {}
+
+
+def _rebuild_member_index():
+    MEMBER_TO_CASE.clear()
+    for cid, case in cases_db.items():
+        for m in _members(case):
+            MEMBER_TO_CASE[m] = cid
+
+
+_rebuild_member_index()
+
+
+# --- 2. O(1)-first case resolution -----------------------------------------
+def _resolve_case(result, before):
+    if isinstance(result, dict):
+        for key in ("assigned_case_id", "case_id"):
+            cid = result.get(key)
+            if cid and cid in cases_db:
+                return cid
+    rid = _extract_rid(result)
+    if rid and rid in MEMBER_TO_CASE:
+        return MEMBER_TO_CASE[rid]
+    best = None
+    for cid, c in cases_db.items():
+        delta = _member_count(c) - before.get(cid, 0)
+        if delta > 0:
+            key = (delta, float(c.get("case_score") or 0))
+            if best is None or key > best[0]:
+                best = (key, cid)
+    return best[1] if best else None
+
+
+def _commit_result(result, before):
+    cid = _resolve_case(result, before)
+    rid = _extract_rid(result)
+    if rid and cid:
+        MEMBER_TO_CASE[rid] = cid
+    return cid
+
+
+# --- 3. per-review scores + fired rules, loaded once ------------------------
+LF_LABEL = {
+    "lf_near_duplicate":     "copy-paste text",
+    "lf_shared_device":      "shared device",
+    "lf_shared_ip":          "shared IP",
+    "lf_shared_payment":     "shared payment",
+    "lf_burst":              "review burst",
+    "lf_new_account_active": "new account",
+    "lf_high_velocity":      "high velocity",
+    "lf_seller_new_5star":   "new-account 5-stars",
+}
+
+
+def _gt0(v):
+    try:
+        return float(v) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _load_per_review_scores():
+    labeled = _os.path.join(BASE_DIR, "labeled_features.csv")
+    scored = _os.path.join(BASE_DIR, "scored_features.csv")
+
+    lf_hits = {}
+    if _os.path.exists(labeled):
+        with open(labeled, newline="", encoding="utf-8") as fh:
+            for row in _csv.DictReader(fh):
+                rid = row.get("review_id")
+                if not rid:
+                    continue
+                fired = [LF_LABEL[k] for k in LF_LABEL if _gt0(row.get(k))]
+                if fired:
+                    lf_hits[rid] = fired
+
+    if not _os.path.exists(scored):
+        print("[console-api] scored_features.csv missing — feed scores stay 0")
+        return
+
+    n = 0
+    with open(scored, newline="", encoding="utf-8") as fh:
+        for row in _csv.DictReader(fh):
+            rid = row.get("review_id")
+            if rid not in REVIEW_INDEX:
+                continue
+            try:
+                REVIEW_INDEX[rid]["risk_score"] = float(row.get("risk_score") or 0)
+            except (TypeError, ValueError):
+                REVIEW_INDEX[rid]["risk_score"] = 0.0
+            REVIEW_INDEX[rid]["rules"] = lf_hits.get(rid, [])
+            n += 1
+    print("[console-api] per-review scores loaded:", n)
+
+
+FEED_CACHE = []
+
+
+def _build_feed_cache():
+    global FEED_CACHE
+    rows = []
+    for rid, info in REVIEW_INDEX.items():
+        raw = info.get("risk_score")
+        rows.append({
+            "review_id": rid,
+            "risk_score": _score_100(raw) if raw is not None else 0,
+            "raw_risk": round(float(raw or 0), 4),
+            "seller_id": info.get("seller_id") or "—",
+            "account_id": info.get("account_id") or "—",
+            "rating": info.get("rating") or 0,
+            "review_text": info.get("text") or "",
+            "triggered_rules": info.get("rules") or [],
+        })
+    rows.sort(key=lambda r: r["raw_risk"], reverse=True)
+    FEED_CACHE = rows
+    print("[console-api] feed cached:", len(rows))
+
+
+_load_per_review_scores()
+_build_feed_cache()
+
+
+# --- 4. endpoints -----------------------------------------------------------
+@app.get("/api/reviews")
+def api_reviews(limit: int = 80, flagged_only: bool = False):
+    rows = FEED_CACHE
+    if flagged_only:
+        rows = [r for r in rows if r["risk_score"] >= 50]
+    return {"reviews": rows[:limit], "total": len(rows)}
+
+
+@app.post("/api/reset")
+def api_reset():
+    cases_db.clear()
+    cases_db.update(_copy.deepcopy(_BASELINE_CASES))
+    global linker
+    if _BASELINE_LINKER is not None:
+        try:
+            linker = _copy.deepcopy(_BASELINE_LINKER)
+        except Exception:
+            pass
+    _rebuild_member_index()
+    return {"ok": True, "cases": len(cases_db)}
+
+# ============================================================================
+# console-api v5.5 — feed rule parsing, scoped live indexing, batch ingest
+# ============================================================================
+
+app.router.routes = [r for r in app.router.routes
+                     if getattr(r, "path", None) not in {"/api/reviews", "/api/ingest/batch"}]
+
+
+# --- 1. boolean-tolerant rule parsing + column auto-discovery ---------------
+def _gt0(v):
+    if v is None:
+        return False
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s in ("true", "t", "yes", "1", "1.0"):
+        return True
+    if s in ("false", "f", "no", "0", "0.0", "nan", "none", "null", ""):
+        return False
+    try:
+        return float(s) > 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _lf_columns(path):
+    with open(path, newline="", encoding="utf-8") as fh:
+        header = next(_csv.reader(fh), [])
+    return [c for c in header if c.strip().lower().startswith("lf_")]
+
+
+def _reload_rule_hits():
+    path = _os.path.join(BASE_DIR, "labeled_features.csv")
+    if not _os.path.exists(path):
+        print("[console-api] labeled_features.csv missing — rules stay empty")
+        return 0
+    cols = _lf_columns(path)
+    print("[console-api] lf columns discovered:", cols)
+    hits = 0
+    with open(path, newline="", encoding="utf-8") as fh:
+        for row in _csv.DictReader(fh):
+            rid = row.get("review_id")
+            if not rid or rid not in REVIEW_INDEX:
+                continue
+            fired = [LF_LABEL.get(c, c[3:].replace("_", " "))
+                     for c in cols if _gt0(row.get(c))]
+            REVIEW_INDEX[rid]["rules"] = fired
+            if fired:
+                hits += 1
+    print("[console-api] reviews with fired rules:", hits)
+    return hits
+
+
+# --- 2. cache the ingest route (it was re-scanned on every review) ---------
+_ROUTE_CACHE = {}
+
+
+def _cached_route():
+    route = _ROUTE_CACHE.get("route")
+    if route is None:
+        route = _find_ingest_route()
+        _ROUTE_CACHE["route"] = route
+    return route
+
+
+def _rd(job):
+    return job[1] if isinstance(job, tuple) and len(job) == 2 else None
+
+
+def _lookup_rid(result):
+    if isinstance(result, dict):
+        for k in ("review_id", "rid"):
+            if result.get(k) is not None:
+                return str(result[k])
+        sr = result.get("scored_review")
+        if isinstance(sr, dict) and sr.get("review_id") is not None:
+            return str(sr["review_id"])
+    return None
+
+
+def _index_live(payload, result, before):
+    """Index a runtime review. Scans only cases that actually grew."""
+    rid = _lookup_rid(result)
+    if rid is None:
+        for cid, c in cases_db.items():
+            if _member_count(c) <= before.get(cid, 0):
+                continue
+            for m in _members(c):
+                if m not in REVIEW_INDEX:
+                    rid = m
+                    break
+            if rid:
+                break
+    if rid is None or rid in REVIEW_INDEX:
+        return rid
+    REVIEW_INDEX[rid] = {
+        "text": (payload.get("review_text") or payload.get("text_")
+                 or payload.get("text") or "")[:300],
+        "rating": float(payload.get("rating") or 0),
+        "seller_id": payload.get("seller_id") or "",
+        "account_id": payload.get("account_id") or "",
+        "device": payload.get("device_fingerprint") or "",
+        "ip": payload.get("ip_block") or "",
+        "payment": payload.get("payment_instrument") or "",
+        "rules": [],
+    }
+    return rid
+
+
+async def _invoke_ingest(payload):
+    global _LAST_BEFORE
+    route = _cached_route()
+    if route is None:
+        raise RuntimeError("no POST /ingest route is registered on this app")
+
+    fn = route.endpoint
+    arg = _build_call_arg(fn, payload)
+    result = fn() if arg is _inspect._empty else fn(arg)
+    if _inspect.isawaitable(result):
+        result = await result
+
+    try:
+        before = globals().get("_LAST_BEFORE") or {}
+        rid = _index_live(payload, result, before)
+        if rid is not None:
+            cid = _resolve_case(result, before)
+            if cid:
+                MEMBER_TO_CASE[rid] = cid
+    except Exception as exc:
+        print("[console-api] live index failed:", exc)
+    return result
+
+
+def _commit_result(result, before):
+    cid = _resolve_case(result, before)
+    rid = _lookup_rid(result)
+    if rid:
+        MEMBER_TO_CASE[rid] = cid
+    return cid
+
+
+# --- 3. batch ingest (amortises HTTP + FastAPI per-review cost) ------------
+@app.post("/api/ingest/batch")
+async def api_ingest_batch(body: dict = None):
+    global _last_latency_ms, _LAST_BEFORE
+    body = body or {}
+    n = max(1, min(2000, int(body.get("n") or 500)))
+    seller = body.get("seller_id") or "SEL_003"
+    device = body.get("shared_device") or "DEV-BATCH-RING"
+    payment = body.get("shared_payment") or "PAY-BATCH-RING"
+    subnet = body.get("shared_subnet") or "198.18.0.0/24"
+    text = body.get("review_text") or "AMAZING 10/10 MUST BUY! Best seller ever!"
+    tag = body.get("tag") or "BATCH"
+
+    before = _case_snapshot()
+    _LAST_BEFORE = before
+    t0 = _time.perf_counter()
+    result = None
+    try:
+        for i in range(n):
+            result = await _invoke_ingest(_ring_payload(
+                _next_account(tag), seller, text, device, subnet, payment,
+                2.0 + (i % 24) * 0.1))
+    except Exception as exc:
+        return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+
+    elapsed = _time.perf_counter() - t0
+    _last_latency_ms = round(elapsed * 1000, 1)
+    cid = _resolve_case(result, before)
+    case = cases_db.get(cid) if cid else None
+
+    return {
+        "ok": True,
+        "case_id": cid,
+        "member_count": len(_members(case)) if case else 0,
+        "ingested": n,
+        "elapsed_ms": _last_latency_ms,
+        "per_review_ms": round(elapsed * 1000 / n, 3),
+        "reviews_per_sec": round(n / elapsed, 1),
+    }
+
+
+@app.get("/api/reviews")
+def api_reviews(limit: int = 80, flagged_only: bool = False):
+    rows = FEED_CACHE
+    if flagged_only:
+        rows = [r for r in rows if r["risk_score"] >= 50]
+    return {"reviews": rows[:limit], "total": len(rows)}
+
+
+_LAST_BEFORE = {}
+_reload_rule_hits()
+_build_feed_cache()
+print("[console-api] v5.5 ready")
+
+# ============================================================================
+# console-api v5.6 — rules from scored_features.csv + teammate integrations:
+#   • dual TF-IDF (word 1-2 + char_wb 3-5) + hyperbolic keyword signal
+#   • GET /api/evaluation  (P@K, ring_linking_rate, stress_test_pass, coverage)
+# ============================================================================
+
+app.router.routes = [r for r in app.router.routes
+                     if getattr(r, "path", None) not in {
+                         "/api/reviews", "/api/custom/review", "/api/evaluation"}]
+
+
+# --- 1. rebuild rules from scored_features.csv (no labeled_features.csv) ----
+def _fval(row, *names):
+    for n in names:
+        v = row.get(n)
+        if v not in (None, "", "nan", "NaN"):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                pass
+    return 0.0
+
+
+def _rules_from_row(row, lf_cols):
+    # path A: lf_* columns exist right inside scored_features.csv
+    if lf_cols:
+        return [LF_LABEL.get(c, c[3:].replace("_", " "))
+                for c in lf_cols if _gt0(row.get(c))]
+
+    # path B: evaluate Phase-2 thresholds directly on the feature columns
+    fired = []
+    if _fval(row, "near_dup_score", "max_text_similarity") > 0.75:
+        fired.append("copy-paste text")
+    if _fval(row, "shared_device_count", "accounts_per_device") >= 5:
+        fired.append("shared device")
+    if _fval(row, "shared_ip_count", "accounts_per_subnet") >= 5:
+        fired.append("shared IP")
+    if _fval(row, "shared_payment_count", "accounts_per_payment") >= 5:
+        fired.append("shared payment")
+    if _fval(row, "burst_count", "seller_1h_burst_count") >= 1:
+        fired.append("review burst")
+    if (0 < _fval(row, "account_age_hours") < 24
+            and _fval(row, "account_review_count", " account_total_reviews") > 1):
+        fired.append("new account")
+    if _fval(row, "review_velocity", "seller_7d_velocity_ratio") > 2.5:
+        fired.append("high velocity")
+    if _fval(row, "seller_new_5star_ratio", "seller_fresh_rev_ratio") > 0.05:
+        fired.append("new-account 5-stars")
+    return fired
+
+
+def _load_rules_fallback():
+    for name in ("labeled_features.csv", "scored_features.csv", "features.csv"):
+        path = _os.path.join(BASE_DIR, name)
+        if not _os.path.exists(path):
+            continue
+        lf_cols = _lf_columns(path)
+        hits = 0
+        with open(path, newline="", encoding="utf-8") as fh:
+            for row in _csv.DictReader(fh):
+                rid = row.get("review_id")
+                if not rid or rid not in REVIEW_INDEX:
+                    continue
+                fired = _rules_from_row(row, lf_cols)
+                if fired:
+                    REVIEW_INDEX[rid]["rules"] = fired
+                    hits += 1
+        print("[console-api] rules reconstructed from %s: %d reviews" % (name, hits))
+        if hits > 0:
+            return
+
+
+_load_rules_fallback()
+_build_feed_cache()
+
+
+# --- 2. teammate's dual TF-IDF + hyperbolic keyword scorer ------------------
+HYPERBOLIC_KEYWORDS = (
+    "must buy", "10/10", "game changing", "flawless", "unbelievable",
+    "best purchase", "stellar service", "exceeded expectations",
+    "game-changer", "highly recommend", "superb quality", "best seller ever",
+)
+
+_SELLER_DOCS = {}
+for _rid, _info in REVIEW_INDEX.items():
+    _sid = _info.get("seller_id")
+    _txt = _info.get("text")
+    if _sid and _txt and len(_SELLER_DOCS.get(_sid, ())) < 60:
+        _SELLER_DOCS.setdefault(_sid, []).append(_txt)
+
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer as _Tfidf
+    from sklearn.metrics.pairwise import cosine_similarity as _cos
+
+    _sample_corpus = [info["text"] for info in list(REVIEW_INDEX.values())[:6000]
+                      if info.get("text")]
+    _WORD_VEC = _Tfidf(max_features=400, stop_words="english", ngram_range=(1, 2)).fit(_sample_corpus)
+    _CHAR_VEC = _Tfidf(max_features=500, analyzer="char_wb", ngram_range=(3, 5)).fit(_sample_corpus)
+    print("[console-api] dual TF-IDF fitted on %d reviews" % len(_sample_corpus))
+except Exception as _exc:
+    _WORD_VEC = _CHAR_VEC = None
+    print("[console-api] TF-IDF unavailable:", _exc)
+
+
+def _text_signals(text, seller_id):
+    lower = (text or "").lower()
+    kw = sum(1 for k in HYPERBOLIC_KEYWORDS if k in lower)
+    word_sim = char_sim = 0.0
+    peer_texts = _SELLER_DOCS.get(seller_id) or _sample_corpus[:120]
+    if _WORD_VEC is not None and text and peer_texts:
+        try:
+            w = _cos(_WORD_VEC.transform([text]), _WORD_VEC.transform(peer_texts)).max()
+            c = _cos(_CHAR_VEC.transform([text]), _CHAR_VEC.transform(peer_texts)).max()
+            word_sim, char_sim = float(w), float(c)
+        except Exception:
+            pass
+    comp_sim = 0.5 * word_sim + 0.5 * char_sim
+    rules = []
+    if comp_sim >= 0.75 or char_sim >= 0.88:
+        rules.append("copy-paste text")
+    if kw >= 2:
+        rules.append("hyperbolic promo (%d)" % kw)
+    return comp_sim, char_sim, kw, rules
+
+
+@app.post("/api/custom/review")
+async def api_custom_review(payload: dict):
+    global _last_latency_ms, _LAST_BEFORE
+
+    before = _case_snapshot()
+    _LAST_BEFORE = before
+    t0 = _time.perf_counter()
+    try:
+        result = await _invoke_ingest(payload)
+    except Exception as exc:
+        return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+
+    text = payload.get("review_text") or ""
+    seller = payload.get("seller_id") or "SEL_003"
+    comp_sim, char_sim, kw, extra_rules = _text_signals(text, seller)
+
+    _last_latency_ms = round((_time.perf_counter() - t0) * 1000, 1)
+    cid = _resolve_case(result, before)
+    case = cases_db.get(cid) if cid else None
+
+    _rs = _as_result_dict(result).get("risk_score")
+    base = (
+    float(_rs) if _rs is not None else 0.0
+    ) or (case.get("max_risk") if case else 0.0) or 0.0
+    # blend in the text/promo signal when the base scorer sees a cold account
+    promo_boost = (0.35 if comp_sim >= 0.75 else 0.20 * comp_sim) + min(0.35, 0.12 * kw)
+    score_100 = max(_score_100(base), min(98, int(round((base + promo_boost) * 100))))
+
+    rid = _lookup_rid(result)
+    if rid and rid in REVIEW_INDEX:
+        REVIEW_INDEX[rid]["rules"] = extra_rules
+        REVIEW_INDEX[rid]["risk_score"] = score_100 / 100.0 * SCORE_CEILING
+
+    return {
+        "ok": True,
+        "scored_review": {
+            "review_id": rid,
+            "risk_score": score_100,
+            "text_similarity": round(comp_sim, 3),
+            "char_similarity": round(char_sim, 3),
+            "promo_keywords": kw,
+            "triggered_rules": extra_rules,
+        },
+        "assigned_case_id": cid,
+        "latency_ms": _last_latency_ms,
+    }
+
+
+@app.get("/api/reviews")
+def api_reviews(limit: int = 80, flagged_only: bool = False):
+    rows = FEED_CACHE
+    if flagged_only:
+        rows = [r for r in rows if r["risk_score"] >= 35 or r["triggered_rules"]]
+    return {"reviews": rows[:limit], "total": len(rows)}
+
+
+# --- 3. teammate's evaluation module, adapted to our ground truth ----------
+@app.get("/api/evaluation")
+def api_evaluation():
+    ring_case = cases_db.get("CASE-0000") or {}
+    ring_rids = set(_members(_BASELINE_CASES.get("CASE-0000") or ring_case))
+    n_pos = len(ring_rids) or 7
+
+    ranked = [r["review_id"] for r in FEED_CACHE]
+    p_at_k, r_at_k = {}, {}
+    for k in (5, 10, 20, 50):
+        tp = len(set(ranked[:k]) & ring_rids)
+        p_at_k["P@%d" % k] = round(tp / k, 3)
+        r_at_k["R@%d" % k] = round(tp / n_pos, 3)
+
+    ring_cases = [cid for cid, c in cases_db.items()
+                  if set(_members(c)) & ring_rids]
+    top_overlap = max((len(set(_members(cases_db[cid])) & ring_rids)
+                       for cid in ring_cases), default=0)
+    link_rate = round(top_overlap / n_pos, 3)
+
+    api_rows = [_case_to_api(cid, c) for cid, c in list(cases_db.items())[:200]]
+    explained = sum(1 for r in api_rows if r["explanation_summary"].strip())
+
+    return {
+        "precision_at_k": p_at_k,
+        "recall_at_k": r_at_k,
+        "ring_members_ground_truth": n_pos,
+        "ring_cases_found": len(ring_cases),
+        "ring_linking_rate": link_rate,
+        "fragmentation_rate": 0.0 if len(ring_cases) == 1 else round(1 - 1 / max(1, len(ring_cases)), 3),
+        "stress_test_pass": bool(link_rate == 1.0 and len(ring_cases) == 1),
+        "explainability_coverage_pct": round(explained / max(1, len(api_rows)) * 100, 1),
+    }
+
+# ---------- assistant ----------
+
+# ---------- assistant ----------
+
+try:
+    from rag_assistant import TrustNetRAG
+    RAG = TrustNetRAG()
+except Exception as _e:
+    RAG = None
+    print(f"[console-api] assistant disabled: {type(_e).__name__}: {_e}")
+
+
+def _rag_dict(obj):
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        return obj
+    for meth in ("model_dump", "dict"):
+        fn = getattr(obj, meth, None)
+        if callable(fn):
+            try:
+                d = fn()
+                if isinstance(d, dict):
+                    return d
+            except Exception:
+                pass
+    try:
+        return {k: v for k, v in vars(obj).items() if not k.startswith("_")}
+    except Exception:
+        return {}
+
+
+def _rag_list(val):
+    if val is None:
+        return []
+    if isinstance(val, (list, tuple, set)):
+        out = []
+        for v in val:
+            out.extend(_rag_list(v))
+        return out
+    s = str(val).strip()
+    if not s or s.lower() in ("nan", "none", "null", "[]"):
+        return []
+    if s[0] in "[(" and s[-1] in ")]":
+        try:
+            import json as _json
+            parsed = _json.loads(s)
+            return [str(x).strip() for x in parsed if str(x).strip()]
+        except Exception:
+            pass
+    return [p.strip() for p in s.replace("|", ",").replace(";", ",").split(",") if p.strip()]
+
+
+def _rag_score_100(raw):
+    try:
+        return int(round(float(raw) / 2.0 * 100))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _rag_review(rid):
+    idx = globals().get("REVIEW_INDEX")
+    if not isinstance(idx, dict):
+        return None
+    for k in (rid, str(rid), str(rid).strip()):
+        try:
+            rec = idx.get(k)
+        except Exception:
+            rec = None
+        if rec is not None:
+            return rec
+    try:
+        return idx.get(int(str(rid).strip()))
+    except Exception:
+        return None
+
+
+def _rag_cases_endpoint():
+    """Serve the assistant from the same payload the console renders,
+    so the two can never disagree."""
+    try:
+        import asyncio
+        import inspect
+    except Exception:
+        return None
+    for r in getattr(app, "routes", []):
+        if getattr(r, "path", None) != "/api/cases":
+            continue
+        if "GET" not in (getattr(r, "methods", None) or ()):
+            continue
+        fn = getattr(r, "endpoint", None)
+        if not callable(fn):
+            continue
+        try:
+            if inspect.iscoroutinefunction(fn):
+                return asyncio.run(fn())
+            return fn()
+        except Exception as e:
+            print(f"[console-api] assistant: /api/cases call failed: "
+                  f"{type(e).__name__}: {e}")
+            return None
+    return None
+
+
+def _rag_from_payload(payload):
+    if not isinstance(payload, dict):
+        return None
+    rows = payload.get("cases")
+    if not isinstance(rows, list) or not rows:
+        return None
+
+    import re as _re
+    case_index, seller_index, tier_counts = {}, {}, {}
+
+    for row in rows:
+        c = _rag_dict(row)
+        cid = str(c.get("case_id") or "").strip().upper()
+        if not cid:
+            continue
+
+        tier = str(c.get("severity_tier") or c.get("tier") or "WATCH").strip().upper()
+
+        score = c.get("case_score_100")
+        if score is None:
+            score = _rag_score_100(c.get("case_score"))
+        try:
+            score = int(score)
+        except (TypeError, ValueError):
+            score = 0
+
+        sels = []
+        for s in (c.get("sellers_involved") or []):
+            s = str(s).strip()
+            if s and s not in sels:
+                sels.append(s)
+        if not sels:
+            for rid in _rag_list(c.get("member_ids")):
+                rec = _rag_dict(_rag_review(rid))
+                s = rec.get("seller_id") or rec.get("seller")
+                if s and str(s).strip() not in sels:
+                    sels.append(str(s).strip())
+
+        sigs = [str(s).strip() for s in (c.get("shared_signals") or []) if str(s).strip()]
+
+        members = c.get("review_count")
+        if members is None:
+            members = c.get("account_count")
+        if members is None:
+            members = len(_rag_list(c.get("member_ids")))
+        try:
+            members = int(members or 0)
+        except (TypeError, ValueError):
+            members = 0
+
+        try:
+            span = float(c.get("time_span_minutes") or 0)
+        except (TypeError, ValueError):
+            span = 0.0
+        if not span:
+            m = _re.search(r"(\d+(?:\.\d+)?)\s*-?\s*minute",
+                           str(c.get("explanation_summary") or ""), _re.I)
+            if m:
+                try:
+                    span = float(m.group(1))
+                except ValueError:
+                    span = 0.0
+
+        summary = {"case_id": cid, "tier": tier, "score_100": score,
+                   "members": members, "sellers": sels,
+                   "signals": sigs, "span_min": span}
+        case_index[cid] = summary
+        tier_counts[tier] = tier_counts.get(tier, 0) + 1
+        for s in sels:
+            seller_index.setdefault(s.upper(), []).append(summary)
+
+    return case_index, seller_index, tier_counts
+
+
+def _rag_from_csv():
+    import csv as _csv
+    import os as _os
+    path = "cases.csv"
+    if not _os.path.exists(path):
+        return None
+
+    case_index, seller_index, tier_counts = {}, {}, {}
+    with open(path, newline="", encoding="utf-8") as f:
+        for row in _csv.DictReader(f):
+            cid = str(row.get("case_id") or "").strip().upper()
+            if not cid:
+                continue
+            tier = str(row.get("severity_tier") or row.get("tier") or "WATCH").strip().upper()
+            score = _rag_score_100(row.get("case_score"))
+
+            sels = []
+            for key in ("sellers_involved", "seller_ids", "sellers", "seller_id"):
+                for s in _rag_list(row.get(key)):
+                    if s and s not in sels:
+                        sels.append(s)
+            if not sels:
+                for rid in _rag_list(row.get("member_ids")):
+                    rec = _rag_dict(_rag_review(rid))
+                    s = rec.get("seller_id") or rec.get("seller")
+                    if s and str(s).strip() not in sels:
+                        sels.append(str(s).strip())
+
+            sigs = _rag_list(row.get("signal_types")) or _rag_list(row.get("signals"))
+
+            members = 0
+            for key in ("n_members", "member_count"):
+                try:
+                    members = int(float(row.get(key) or 0))
+                except (TypeError, ValueError):
+                    members = 0
+                if members:
+                    break
+            if not members:
+                members = len(_rag_list(row.get("member_ids")))
+
+            try:
+                span = float(row.get("time_span_minutes") or 0)
+            except (TypeError, ValueError):
+                span = 0.0
+
+            summary = {"case_id": cid, "tier": tier, "score_100": score,
+                       "members": members, "sellers": sels,
+                       "signals": sigs, "span_min": span}
+            case_index[cid] = summary
+            tier_counts[tier] = tier_counts.get(tier, 0) + 1
+            for s in sels:
+                seller_index.setdefault(s.upper(), []).append(summary)
+
+    return case_index, seller_index, tier_counts
+
+
+def _build_rag_context():
+    built = _rag_from_payload(_rag_cases_endpoint())
+    source = "/api/cases"
+    if not built:
+        built = _rag_from_csv()
+        source = "cases.csv"
+    if not built:
+        built = ({}, {}, {})
+        source = "none"
+
+    case_index, seller_index, tier_counts = built
+    ranked = sorted(case_index.values(), key=lambda c: (-c["score_100"], c["case_id"]))
+    with_sellers = sum(1 for c in case_index.values() if c["sellers"])
+    print(f"[console-api] assistant context from {source}: "
+          f"{len(case_index)} cases, {len(seller_index)} sellers, "
+          f"{with_sellers} with sellers")
+
+    idx = globals().get("REVIEW_INDEX")
+    review_counts = {}
+    total_reviews = 0
+    if isinstance(idx, dict):
+        total_reviews = len(idx)
+        for rec in idx.values():
+            rec = rec if isinstance(rec, dict) else _rag_dict(rec)
+            s = rec.get("seller_id") or rec.get("seller")
+            if s:
+                key = str(s).strip().upper()
+                review_counts[key] = review_counts.get(key, 0) + 1
+
+    return {
+        "case_index": case_index,
+        "seller_index": seller_index,
+        "seller_review_counts": review_counts,
+        "tier_counts": tier_counts,
+        "total_cases": len(case_index),
+        "total_reviews": total_reviews,
+        "fragmentation_pct": 0,
+        "top_case": ranked[0] if ranked else None,
+    }
+
+
+_RAG_CACHE = {"ctx": None, "ts": 0.0}
+
+
+def _rag_ctx(active_case_id=None):
+    import time as _time
+    now = _time.time()
+    if _RAG_CACHE["ctx"] is None or (now - _RAG_CACHE["ts"]) > 2.0:
+        _RAG_CACHE["ctx"] = _build_rag_context()
+        _RAG_CACHE["ts"] = now
+    ctx = dict(_RAG_CACHE["ctx"])
+    if active_case_id:
+        hit = ctx["case_index"].get(str(active_case_id).strip().upper())
+        if hit:
+            ctx["active_case"] = hit
+        else:
+            ctx.pop("active_case", None)
+    return ctx
+
+
+@app.post("/api/assistant")
+def api_assistant(payload: dict):
+    if RAG is None:
+        return {"answer": "Assistant unavailable.", "sources": [], "intent": "disabled"}
+    payload = payload or {}
+    try:
+        ctx = _rag_ctx(payload.get("case_id"))
+        return RAG.answer(payload.get("query", ""), ctx)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {"answer": f"Assistant error: {type(e).__name__}: {e}",
+                "sources": [], "intent": "error"}
+    
+if __name__ == "__main__":
+    import uvicorn
+    print("\n🚀 TrustNet API on http://127.0.0.1:8000")
+    uvicorn.run(app, host="0.0.0.0", port=8000)

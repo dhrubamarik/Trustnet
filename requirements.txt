@@ -1,0 +1,23 @@
+# TrustNet — runtime dependencies
+# Developed on Python 3.14 (Windows). Requires Python >= 3.11.
+
+# --- Web / API ---
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic>=2.9.0
+python-multipart>=0.0.12
+
+# --- Data science ---
+numpy>=1.26.0
+pandas>=2.2.0
+scikit-learn>=1.5.0
+
+# --- Graph linking ---
+networkx>=3.3
+
+# --- HTTP (benchmarks + tests) ---
+requests>=2.32.0
+httpx>=0.27.0
+
+# --- Testing ---
+pytest>=8.3.0

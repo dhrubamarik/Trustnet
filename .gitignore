@@ -1,0 +1,52 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ---------- Virtual environments ----------
+.venv/
+venv/
+env/
+ENV/
+.conda/
+
+# ---------- Environment secrets ----------
+.env
+.env.local
+.env.*.local
+
+# ---------- IDE / OS ----------
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- TrustNet generated artifacts ----------
+# These are rebuilt by the pipeline; do not commit.
+enriched_reviews.csv
+features.csv
+labeled_features.csv
+scored_features.csv
+clusters.csv
+cases.csv
+graph_state.pkl
+*.log
+
+# ---------- Raw dataset ----------
+# 40,432-row Kaggle export — too large for git.
+# Share via zip or Git LFS if the repo needs it.
+FAKE.csv
+
+# ---------- Debug scratch ----------
+debug.html
+phase4_graph.py   # deprecated

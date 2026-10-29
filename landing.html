@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TrustNet — Coordinated Review Ring Detection</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+    --ease: cubic-bezier(.2, .8, .2, 1);
+  }
+  html[data-theme="dark"] {
+    --bg: #0a0a0a; --surface: #101010; --surface-2: #181818;
+    --ink: #f5f5f5; --ink-2: #a3a3a3; --ink-3: #6b6b6b;
+    --line: #232323; --line-2: #383838;
+    --crit: #ff5252; --warn: #f5a524; --ok: #3ecf8e; --info: #6ea8fe;
+    color-scheme: dark;
+  }
+  html[data-theme="light"] {
+    --bg: #ffffff; --surface: #fbfbfb; --surface-2: #f2f2f2;
+    --ink: #0a0a0a; --ink-2: #5c5c5c; --ink-3: #909090;
+    --line: #e6e6e6; --line-2: #cfcfcf;
+    --crit: #cc1616; --warn: #a36000; --ok: #0d7a4c; --info: #1a56c4;
+    color-scheme: light;
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--ink); font-family: var(--sans);
+    line-height: 1.55; -webkit-font-smoothing: antialiased;
+    transition: background-color .16s var(--ease), color .16s var(--ease);
+  }
+  .mono { font-family: var(--mono); }
+  .dim { color: var(--ink-3); }
+  a { color: inherit; text-decoration: none; }
+
+  /* nav */
+  .nav {
+    position: sticky; top: 0; z-index: 40;
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0 40px; height: 60px;
+    background: var(--bg); border-bottom: 1px solid var(--line-2);
+  }
+  .brand { display: flex; align-items: baseline; gap: 12px; }
+  .wordmark {
+    font-family: var(--mono); font-size: 13px; font-weight: 700;
+    letter-spacing: .22em; text-transform: uppercase;
+  }
+  .brand-sub {
+    font-family: var(--mono); font-size: 10px; letter-spacing: .14em;
+    text-transform: uppercase; color: var(--ink-3);
+  }
+  .nav-actions { display: flex; align-items: center; gap: 12px; }
+  .seg {
+    display: inline-flex; border: 1px solid var(--line-2); border-radius: 2px;
+  }
+  .seg button {
+    font-family: var(--mono); font-size: 9px; letter-spacing: .12em;
+    text-transform: uppercase; padding: 6px 11px;
+    background: transparent; color: var(--ink-3);
+    border: 0; border-left: 1px solid var(--line-2); cursor: pointer;
+    transition: background-color .14s var(--ease), color .14s var(--ease);
+  }
+  .seg button:first-child { border-left: 0; }
+  .seg button[aria-pressed="true"] { background: var(--ink); color: var(--bg); }
+
+  .btn {
+    font-family: var(--mono); font-size: 10px; font-weight: 500;
+    letter-spacing: .12em; text-transform: uppercase;
+    padding: 9px 18px; border: 1px solid var(--line-2);
+    background: transparent; color: var(--ink); cursor: pointer;
+    border-radius: 2px;
+    transition: background-color .14s var(--ease), color .14s var(--ease),
+                border-color .14s var(--ease), opacity .14s var(--ease);
+  }
+  .btn:hover { background: var(--surface-2); }
+  .btn-primary { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+  .btn-primary:hover { opacity: .82; background: var(--ink); }
+
+  /* hero */
+  .hero { padding: 120px 40px 60px; max-width: 1400px; margin: 0 auto; }
+  .eyebrow {
+    font-family: var(--mono); font-size: 10px; letter-spacing: .22em;
+    text-transform: uppercase; color: var(--ink-3); margin-bottom: 32px;
+  }
+  h1 {
+    font-size: clamp(48px, 8vw, 112px); line-height: .95;
+    letter-spacing: -.035em; font-weight: 600;
+    margin: 0 0 32px 0; max-width: 14ch;
+  }
+  h1 span { color: var(--ink-3); }
+  .lede {
+    font-size: clamp(16px, 1.5vw, 19px); line-height: 1.55;
+    color: var(--ink-2); max-width: 60ch; margin: 0 0 42px 0;
+  }
+  .ctas { display: flex; gap: 10px; flex-wrap: wrap; }
+
+  /* metrics strip */
+  .metrics {
+    display: grid; grid-template-columns: repeat(4, 1fr);
+    border-top: 1px solid var(--line-2);
+    border-bottom: 1px solid var(--line-2);
+  }
+  .metric { padding: 32px 40px; border-left: 1px solid var(--line); }
+  .metric:first-child { border-left: 0; }
+  .metric-label {
+    font-family: var(--mono); font-size: 9px; letter-spacing: .16em;
+    text-transform: uppercase; color: var(--ink-3); margin-bottom: 10px;
+  }
+  .metric-value {
+    font-family: var(--mono); font-size: 42px; font-weight: 500;
+    font-variant-numeric: tabular-nums; letter-spacing: -.03em;
+    line-height: 1;
+  }
+  .metric-value.v-crit { color: var(--crit); }
+  .metric-value.v-ok { color: var(--ok); }
+  .metric-value.v-warn { color: var(--warn); }
+  .metric-note { font-size: 12px; color: var(--ink-3); margin-top: 8px; }
+
+  /* how it works */
+  .section { padding: 100px 40px; max-width: 1400px; margin: 0 auto; }
+  .section-title {
+    font-family: var(--mono); font-size: 11px; letter-spacing: .22em;
+    text-transform: uppercase; color: var(--ink-3); margin-bottom: 42px;
+  }
+  .steps {
+    display: grid; grid-template-columns: repeat(5, 1fr);
+    border: 1px solid var(--line-2);
+  }
+  @media (max-width: 1100px) { .steps { grid-template-columns: 1fr; } .metric { border-left: 0; border-top: 1px solid var(--line); } .metric:first-child { border-top: 0; } .metrics { grid-template-columns: 1fr 1fr; } }
+  @media (max-width: 640px) { .metrics { grid-template-columns: 1fr; } .nav { padding: 0 20px; } .hero, .section { padding-left: 20px; padding-right: 20px; } }
+  .step {
+    padding: 32px 28px; border-left: 1px solid var(--line);
+    display: flex; flex-direction: column; gap: 14px;
+  }
+  .step:first-child { border-left: 0; }
+  .step-idx {
+    font-family: var(--mono); font-size: 10px; letter-spacing: .18em;
+    color: var(--ink-3);
+  }
+  .step-title { font-size: 16px; font-weight: 600; line-height: 1.3; }
+  .step-body { font-size: 13px; line-height: 1.6; color: var(--ink-2); }
+
+  /* stack */
+  .stack-grid {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 0;
+    border: 1px solid var(--line-2);
+  }
+  @media (max-width: 900px) { .stack-grid { grid-template-columns: 1fr 1fr; } }
+  .stack-cell {
+    padding: 26px 24px; border-left: 1px solid var(--line);
+    border-bottom: 1px solid var(--line);
+  }
+  .stack-cell:nth-child(4n+1) { border-left: 0; }
+  .stack-label {
+    font-family: var(--mono); font-size: 9px; letter-spacing: .16em;
+    text-transform: uppercase; color: var(--ink-3); margin-bottom: 10px;
+  }
+  .stack-name {
+    font-family: var(--mono); font-size: 13px; font-weight: 500;
+    margin-bottom: 8px;
+  }
+  .stack-note { font-size: 12px; line-height: 1.55; color: var(--ink-3); }
+
+  /* CTA footer */
+  .cta-block {
+    border-top: 1px solid var(--line-2);
+    border-bottom: 1px solid var(--line-2);
+    padding: 100px 40px; text-align: center;
+  }
+  .cta-title {
+    font-size: clamp(32px, 4vw, 56px); line-height: 1.05;
+    letter-spacing: -.03em; font-weight: 600; margin: 0 0 24px 0;
+  }
+  .cta-lede { font-size: 15px; color: var(--ink-2); margin: 0 0 32px 0; }
+  .cta-block .btn { padding: 14px 28px; font-size: 11px; }
+
+  footer {
+    padding: 40px; max-width: 1400px; margin: 0 auto;
+    display: flex; justify-content: space-between; gap: 24px;
+    font-family: var(--mono); font-size: 10px; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--ink-3);
+    flex-wrap: wrap;
+  }
+  footer a:hover { color: var(--ink); }
+</style>
+</head>
+<body>
+
+<nav class="nav">
+  <div class="brand">
+    <span class="wordmark">TrustNet</span>
+    <span class="brand-sub">Ring Detection Console</span>
+  </div>
+    <div class="nav-actions">
+    <div class="seg" role="group" aria-label="Theme">
+      <button type="button" data-theme-set="light" aria-pressed="false">Light</button>
+      <button type="button" data-theme-set="dark" aria-pressed="true">Dark</button>
+    </div>
+    <a class="btn" href="YOUR_GITHUB_URL" target="_blank" rel="noopener noreferrer">GitHub</a>
+    <a class="btn btn-primary" href="/">Open Console →</a>
+  </div>
+</nav>
+
+<section class="hero">
+  <div class="eyebrow">SYN26-CS12 · IEEE SMC KGEC · SYNAPSE 1.0</div>
+  <h1>One ring. One case. <span>Zero fragmentation.</span></h1>
+  <p class="lede">
+    TrustNet detects coordinated fake-review rings by linking accounts through the
+    infrastructure they share — device, payment token, IP subnet, posting burst —
+    then collapses the entire ring into one high-priority case for a human moderator.
+    Never dozens of scattered flags.
+  </p>
+  <div class="ctas">
+    <a class="btn btn-primary" href="http://127.0.0.1:8000/">Launch Console →</a>
+    <a class="btn" href="#how">How it works</a>
+  </div>
+</section>
+
+<section class="metrics">
+  <div class="metric">
+    <div class="metric-label">Ring Detection</div>
+    <div class="metric-value v-ok">100%</div>
+    <div class="metric-note">10 / 10 held-out rings</div>
+  </div>
+  <div class="metric">
+    <div class="metric-label">Fragmentation</div>
+    <div class="metric-value v-ok">0%</div>
+    <div class="metric-note">Never splits into separate cases</div>
+  </div>
+  <div class="metric">
+    <div class="metric-label">Latency</div>
+    <div class="metric-value">7.4<span style="font-size:20px;letter-spacing:.02em"> ms</span></div>
+    <div class="metric-note">At ring size · ≈ 135 reviews/sec</div>
+  </div>
+  <div class="metric">
+    <div class="metric-label">Precision @ 10</div>
+    <div class="metric-value v-warn">0.70</div>
+    <div class="metric-note">All 7 of 7 ring members recalled</div>
+  </div>
+</section>
+
+<section class="section" id="how">
+  <div class="section-title">How it works</div>
+  <div class="steps">
+    <div class="step">
+      <div class="step-idx">01</div>
+      <div class="step-title">Ingest</div>
+      <div class="step-body">
+        Review arrives with text, author, merchant, IP, device and payment token.
+        Text and ratings are real Kaggle data; entity fields are synthesized because platforms never release them.
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-idx">02</div>
+      <div class="step-title">Feature pipeline</div>
+      <div class="step-body">
+        Dual-space TF-IDF (word + char n-grams), entity-sharing counts, temporal velocity.
+        19 numeric features extracted per review.
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-idx">03</div>
+      <div class="step-title">Weak supervision</div>
+      <div class="step-body">
+        Eight weighted labeling functions vote on an anomaly score.
+        Ring separation is 9.6× against baseline reviewers.
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-idx">04</div>
+      <div class="step-title">Graph linking</div>
+      <div class="step-body">
+        Union-find components join entities sharing hardware, payment, IP or copy.
+        Edges below weight 4.0 are dropped — at least two signal types must agree.
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-idx">05</div>
+      <div class="step-title">Case rollup</div>
+      <div class="step-body">
+        Scattered bot accounts collapse into one urgent case with a named-signal
+        evidence trail and a human-readable triage action.
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="section-title">Tech stack</div>
+  <div class="stack-grid">
+    <div class="stack-cell">
+      <div class="stack-label">Language</div>
+      <div class="stack-name">Python 3.14</div>
+      <div class="stack-note">Full stack in one runtime — no polyglot overhead.</div>
+    </div>
+    <div class="stack-cell">
+      <div class="stack-label">API</div>
+      <div class="stack-name">FastAPI + Uvicorn</div>
+      <div class="stack-note">Auto-docs, async ingest, single-file dashboard serving.</div>
+    </div>
+    <div class="stack-cell">
+      <div class="stack-label">ML</div>
+      <div class="stack-name">scikit-learn</div>
+      <div class="stack-note">Gradient Boosting regressor, 5-fold cross_val_predict.</div>
+    </div>
+    <div class="stack-cell">
+      <div class="stack-label">Graph</div>
+      <div class="stack-name">NetworkX + union-find</div>
+      <div class="stack-note">Named edges, 7.8 ms resolution, fully explainable.</div>
+    </div>
+    <div class="stack-cell">
+      <div class="stack-label">Data</div>
+      <div class="stack-name">pandas + numpy</div>
+      <div class="stack-note">40,432-row pipeline, CSV-stage artifacts.</div>
+    </div>
+    <div class="stack-cell">
+      <div class="stack-label">Frontend</div>
+      <div class="stack-name">Vanilla HTML/CSS/JS</div>
+      <div class="stack-note">Zero build step. Judge reads the source.</div>
+    </div>
+    <div class="stack-cell">
+      <div class="stack-label">Assistant</div>
+      <div class="stack-name">TF-IDF + regex guards</div>
+      <div class="stack-note">Retrieval only. Cannot hallucinate.</div>
+    </div>
+    <div class="stack-cell">
+      <div class="stack-label">Tests</div>
+      <div class="stack-name">pytest · 13 passed</div>
+      <div class="stack-note">3 core + 10 parameterized held-out rings.</div>
+    </div>
+  </div>
+</section>
+
+<section class="cta-block">
+  <h2 class="cta-title">See it live.</h2>
+  <p class="cta-lede">Seven accounts. Five signals. Ten minutes. One case.</p>
+  <a class="btn btn-primary" href="http://127.0.0.1:8000/">Open the Console →</a>
+</section>
+
+<footer>
+    <span>TrustNet · v5.7 · Python 3.14</span>
+  <span>SYN26-CS12 · IEEE SMC KGEC</span>
+    <span>
+    <a href="/docs/RESULTS.md">Results</a> ·
+    <a href="/docs/SYSTEM_DESIGN.md">Design</a> ·
+    <a href="/docs/FILE_REFERENCE.md">API</a> ·
+    <a href="YOUR_GITHUB_URL" target="_blank" rel="noopener noreferrer">GitHub</a>
+  </span>
+</footer>
+
+<script>
+(function () {
+  try {
+    var t = localStorage.getItem("trustnet.theme");
+    if (!t) t = window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+    document.documentElement.setAttribute("data-theme", t);
+  } catch (e) {}
+  function apply(t) {
+    document.documentElement.setAttribute("data-theme", t);
+    try { localStorage.setItem("trustnet.theme", t); } catch (e) {}
+    document.querySelectorAll("[data-theme-set]").forEach(function (b) {
+      b.setAttribute("aria-pressed", String(b.dataset.themeSet === t));
+    });
+  }
+  document.querySelectorAll("[data-theme-set]").forEach(function (b) {
+    b.addEventListener("click", function () { apply(b.dataset.themeSet); });
+  });
+  apply(document.documentElement.getAttribute("data-theme") || "dark");
+})();
+</script>
+</body>
+</html>
