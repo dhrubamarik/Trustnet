@@ -99,9 +99,9 @@ class IngestReview(BaseModel):
     seller_id: str = "SELLER-0001"
     account_id: str = "ACCT-NEW-001"
     account_age_hours: float = 3.0
-    device_fingerprint: str = "DEV-UNKNOWN"
-    ip_block: str = "10.0.0.0/24"
-    payment_instrument: str = "PAY-0000-0000"
+    device_fingerprint: str | None = None
+    ip_block: str | None = None
+    payment_instrument: str | None = None
     timestamp: Optional[str] = None
 
 class CaseSummary(BaseModel):
@@ -306,6 +306,25 @@ INGEST_FN = (globals().get("ingest_one")
              or globals().get("ingest_review")
              or globals().get("process_review"))
 # ============================================================================
+
+# ── infrastructure-value hygiene (F1) ──────────────────────────────────────
+_INFRA_PLACEHOLDERS = {
+    "", "none", "null", "nil", "na", "n/a", "nan", "-", "--",
+    "unknown", "undefined", "dev-unknown", "ip-unknown", "pay-unknown",
+    "pay-0000-0000", "device-unknown", "0.0.0.0", "10.0.0.0/24", "127.0.0.1",
+}
+
+
+def _clean_infra(v):
+    """A usable entity id, or None. Blanks and the old DEV-UNKNOWN /
+    10.0.0.0/24 / PAY-0000-0000 placeholders all mean 'no value'."""
+    if v is None:
+        return None
+    try:
+        s = str(v).strip()
+    except Exception:
+        return None
+    return None if s.lower() in _INFRA_PLACEHOLDERS else s
 
 import copy as _copy
 import csv as _csv
@@ -1949,6 +1968,13 @@ def api_reviews(limit: int = 80, flagged_only: bool = False):
         rows = [r for r in rows if r["risk_score"] >= 35 or r["triggered_rules"]]
     return {"reviews": rows[:limit], "total": len(rows)}
 
+@app.get("/api/text-model")
+def api_text_model():
+    try:
+        import text_model
+    except Exception as e:
+        return {"available": False, "error": str(e)}
+    return text_model.model_info()
 
 # --- 3. teammate's evaluation module, adapted to our ground truth ----------
 @app.get("/api/evaluation")
@@ -1972,6 +1998,19 @@ def api_evaluation():
 
     api_rows = [_case_to_api(cid, c) for cid, c in list(cases_db.items())[:200]]
     explained = sum(1 for r in api_rows if r["explanation_summary"].strip())
+
+    try:
+        import text_model
+        _tm = text_model.model_info()
+        _out["text_model"] = {
+            "auc": _tm.get("auc"),
+            "accuracy": _tm.get("accuracy"),
+            "split": _tm.get("split"),
+            "n_total": _tm.get("n_total"),
+            "caveat": _tm.get("caveat"),
+        }
+    except Exception:
+        _out["text_model"] = {"available": False}
 
     return {
         "precision_at_k": p_at_k,
@@ -2292,7 +2331,1221 @@ def api_assistant(payload: dict):
         traceback.print_exc()
         return {"answer": f"Assistant error: {type(e).__name__}: {e}",
                 "sources": [], "intent": "error"}
+
+# ============================================================================
+# console-api v6.1 — full-payload ingest, real scoring, honest tiers,
+#                     isolated rings, seller validation
+# ----------------------------------------------------------------------------
+# Fixes v6:
+#   • /ingest was passing only 4 keys to linker.ingest — text/seller/timing
+#     never reached the text-evidence path. Replaced with a full-payload
+#     /ingest that computes risk, indexes the review, and links on all
+#     evidence before creating/updating the case.
+#   • _live_risk now combines the Kaggle CG/OR model with a hyperbole signal,
+#     so paid-shill style text scores high even though the model answers
+#     "machine-written vs human-written", not "paid vs honest".
+#   • Seller validation is unchanged; api_inject_member now uses a real seller.
+# ============================================================================
+
+import random as _random
+import uuid as _uuid
+
+# --- 1. one tier rule ------------------------------------------------------
+def _num(v, default=None):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return default
+    return default if f != f else f
+
+
+def _tier_for_case(raw_score, diversity, n_members):
+    """Tier is a pure function of case score and signal diversity.
+    _score_100 divides by SCORE_CEILING=2.0, so ESCALATE (raw>=1.0) can
+    never display below 50. The case page and the assistant both rely on it."""
+    raw = _num(raw_score, 0.0) or 0.0
+    if raw >= 1.0 and diversity >= 3:
+        return "ESCALATE"
+    if raw >= 0.5 or diversity >= 2:
+        return "REVIEW"
+    return "WATCH"
+
+
+# --- 2. real per-review risk: model + hyperbole ---------------------------
+def _promo_score(text):
+    """Paid-shill style: hyperbole keyword density. 0..0.95."""
+    lower = str(text or "").lower()
+    kw = sum(1 for k in HYPERBOLIC_KEYWORDS if k in lower)
+    if kw <= 0:
+        return 0.0, 0
+    promo = 0.14 * kw + (0.10 if kw >= 3 else 0.0)
+    return min(0.95, promo), kw
+
+
+def _live_risk(payload):
+    """Risk in [0,1]. Combines two independent text signals plus account cues."""
+    text = str(payload.get("review_text") or payload.get("text_")
+               or payload.get("text") or "").strip()
+
+    generated = 0.0
+    try:
+        import text_model
+        p = text_model.score_text(text)
+        if p is not None:
+            generated = float(p)
+    except Exception:
+        pass
+
+    promo, _kw = _promo_score(text)
+
+    score = max(generated, promo)
+
+    age = _num(payload.get("account_age_hours"))
+    if age is not None and age < 24:
+        score += 0.06
+    if (_num(payload.get("rating"), 0.0) or 0.0) >= 5:
+        score += 0.02
+
+    return round(max(0.0, min(1.0, score)), 4)
+
+
+def _score_100_review(risk):
+    return max(0, min(100, int(round(float(risk or 0.0) * 100))))
+
+
+# --- 3. evidence derivation + case refresh --------------------------------
+def _evidence_for(members):
+    infos = []
+    for m in members:
+        rec = REVIEW_INDEX.get(str(m)) or REVIEW_INDEX.get(m)
+        if isinstance(rec, dict):
+            infos.append(rec)
+    if len(infos) < 2:
+        return set()
+
+    found = set()
+    for key, name in (("device", "shared_device"),
+                      ("payment", "shared_payment"),
+                      ("ip", "shared_ip")):
+        vals = [str(i.get(key)).strip() for i in infos if i.get(key)]
+        if len(vals) >= 2 and len(set(vals)) < len(vals):
+            found.add(name)
+
+    texts = [str(i.get("text") or "").strip().lower() for i in infos]
+    texts = [t for t in texts if t]
+    if len(texts) >= 2 and len(set(texts)) < len(texts):
+        found.add("near_dup_text")
+
+    ages = [_num(i.get("account_age_hours")) for i in infos]
+    ages = [a for a in ages if a is not None]
+    if len(ages) >= 2 and all(a < 24 for a in ages):
+        found.add("fresh_accounts")
+
+    return found
+
+
+def _explain_case(case):
+    n = int(case.get("n_members") or 0)
+    labels = [SIGNAL_LABEL.get(s, str(s).replace("_", " "))
+              for s in case.get("signals", [])]
+    if n >= 2:
+        return ("%d reviews linked by %d independent signal type%s (%s). "
+                "Max individual risk %.2f; case score %.2f."
+                % (n, len(labels), "" if len(labels) == 1 else "s",
+                   ", ".join(labels).lower() or "entity overlap",
+                   float(case.get("max_risk") or 0),
+                   float(case.get("case_score") or 0)))
+    return ("Single review. No shared device, IP, payment, text or timing match "
+            "with any other review. Individual risk %.2f."
+            % float(case.get("max_risk") or 0))
+
+
+def _refresh_case(cid, extra_signals=()):
+    case = cases_db.get(cid)
+    if not isinstance(case, dict):
+        return None
+    members = _members(case)
+    if not members:
+        return case
+
+    risks = []
+    for m in members:
+        rec = REVIEW_INDEX.get(str(m)) or REVIEW_INDEX.get(m) or {}
+        v = rec.get("risk_score") if isinstance(rec, dict) else None
+        f = _num(v)
+        if f is not None:
+            risks.append(f)
+    if not risks:
+        return case
+
+    stored = set(case.get("_extra_signals") or [])
+    evidence = (set(_signals(case)) | _evidence_for(members)
+                | stored | set(extra_signals))
+    evidence = {e for e in evidence if e and str(e).lower() != "none"}
+
+    n = len(members)
+    diversity = len(evidence)
+    max_risk = max(risks)
+    raw = max_risk + size_bonus(n) + diversity_bonus(diversity)
+
+    case["max_risk"] = round(max_risk, 4)
+    case["avg_risk"] = round(sum(risks) / len(risks), 4)
+    case["case_score"] = round(raw, 4)
+    case["signal_diversity"] = diversity
+    case["signals"] = sorted(evidence)
+    case["signal_types"] = ", ".join(sorted(evidence)) if evidence else "none"
+    case["n_members"] = n
+    case["tier"] = _tier_for_case(raw, diversity, n)
+    case["explanation"] = _explain_case(case)
+    return case
+
+
+# --- 4. payload coercion ---------------------------------------------------
+def _coerce_payload(payload):
+    if not isinstance(payload, dict):
+        return payload
+    p = dict(payload)
+    if not p.get("text_"):
+        for k in ("review_text", "text"):
+            if p.get(k):
+                p["text_"] = p[k]
+                break
+    if not p.get("review_text"):
+        for k in ("text_", "text"):
+            if p.get(k):
+                p["review_text"] = p[k]
+                break
+    return p
+
+
+# --- 5. seller validation -------------------------------------------------
+_SELLER_CACHE = {"ids": None, "n": -1}
+
+
+def _seller_id_set():
+    n = len(REVIEW_INDEX)
+    if _SELLER_CACHE["ids"] is not None and _SELLER_CACHE["n"] == n:
+        return _SELLER_CACHE["ids"]
+    found = set()
+    for rec in REVIEW_INDEX.values():
+        if isinstance(rec, dict):
+            s = rec.get("seller_id")
+            if s:
+                found.add(str(s).strip())
+    _SELLER_CACHE["ids"] = found
+    _SELLER_CACHE["n"] = n
+    if found:
+        print("[console-api] known sellers:", len(found))
+    return found
+
+
+def _check_seller(seller_id):
+    s = str(seller_id or "").strip()
+    if not s:
+        return "seller_id is required."
+    known = _seller_id_set()
+    if known and s not in known:
+        sample = ", ".join(sorted(known)[:3])
+        return ("Unknown seller %r. Use one that exists in the dataset, "
+                "for example %s." % (s, sample))
+    return None
+
+
+# --- 6. fresh infrastructure per ring ------------------------------------
+_RING_SEQ = [0]
+
+
+def _fresh_ring_infra(tag=None):
+    _RING_SEQ[0] += 1
+    seq = _RING_SEQ[0]
+    tag = tag or ("%s%d" % (_uuid.uuid4().hex[:6].upper(), seq))
+    return {
+        "tag": "RING-" + tag,
+        "device_fingerprint": "DEV-RING-" + tag,
+        "payment_instrument": "PAY-RING-" + tag,
+        "ip_block": "198.18.%d.%d/24" % (seq % 256, _random.randint(1, 254)),
+    }
+
+
+def _ring_payload(tag_letter, seller, text, infra, age, idx):
+    return {
+        "seller_id": seller,
+        "account_id": "ACC-%s-%02d" % (tag_letter, idx),
+        "rating": 5,
+        "review_text": text,
+        "text_": text,
+        "device_fingerprint": infra["device_fingerprint"],
+        "ip_block": infra["ip_block"],
+        "payment_instrument": infra["payment_instrument"],
+        "account_age_hours": age,
+    }
+
+
+# --- 7. drop every route we are about to redefine ------------------------
+app.router.routes = [r for r in app.router.routes
+                     if getattr(r, "path", None) not in {
+                         "/ingest",
+                         "/api/evaluation",
+                         "/api/custom/review",
+                         "/api/custom/ring",
+                         "/api/stress-test/inject",
+                         "/api/inject-member",
+                         "/api/reviews",
+                     }]
+_ROUTE_CACHE.pop("route", None)   # force the ingest bridge to re-look-up
+
+
+# --- 8. the real /ingest --------------------------------------------------
+@app.post("/ingest")
+def ingest_review_v6(payload: dict):
+    start = time.perf_counter()
+    payload = _coerce_payload(payload or {})
+
+    text = str(payload.get("text_") or payload.get("review_text")
+               or payload.get("text") or "").strip()
+    if not text:
+        raise HTTPException(422, "missing text_/review_text/text")
+
+    rid = payload.get("review_id")
+    try:
+        rid = int(rid) if rid is not None else None
+    except (TypeError, ValueError):
+        rid = None
+    if rid is None:
+        rid = linker._next_id
+    while rid in linker.parent:
+        rid += 1
+
+    seller = str(payload.get("seller_id") or "").strip() or None
+    full = {
+        "review_id": rid,
+        "text_": text,
+        "seller_id": seller,
+        "device_fingerprint": _clean_infra(payload.get("device_fingerprint")),
+        "ip_block": _clean_infra(payload.get("ip_block")),
+        "payment_instrument": _clean_infra(payload.get("payment_instrument")),
+        "account_age_hours": _num(payload.get("account_age_hours")),
+        "timestamp": payload.get("timestamp"),
+        "rating": _num(payload.get("rating"), 5.0),
+    }
+
+    result = linker.ingest(full)
+    members = result["cluster_members"]
+    signals = list(result.get("signals") or [])
+
+    risk = _live_risk({
+        "review_text": text,
+        "rating": payload.get("rating"),
+        "seller_id": seller,
+        "account_age_hours": full["account_age_hours"],
+    })
+
+    REVIEW_INDEX[str(rid)] = {
+        "text": text[:300],
+        "rating": full["rating"] or 0.0,
+        "seller_id": seller or "",
+        "account_id": str(payload.get("account_id") or ""),
+        "device": full["device_fingerprint"] or "",
+        "ip": full["ip_block"] or "",
+        "payment": full["payment_instrument"] or "",
+        "account_age_hours": full["account_age_hours"],
+        "risk_score": risk,
+        "rules": [],
+    }
+    _SELLER_CACHE["ids"] = None   # invalidate so new sellers enter the set
+
+    overlaps = set()
+    for m in members:
+        cid = MEMBER_TO_CASE.get(str(m))
+        if cid and cid in cases_db:
+            overlaps.add(cid)
+
+    if overlaps:
+        primary = max(overlaps, key=lambda c:
+                      int(cases_db[c].get("n_members") or 0))
+        case = cases_db[primary]
+        extra = list(case.get("_extra_signals") or [])
+        for other in overlaps - {primary}:
+            oc = cases_db.pop(other, None)
+            if isinstance(oc, dict):
+                existing = [str(x) for x in _members(case)]
+                for m in _members(oc):
+                    if str(m) not in existing:
+                        case.setdefault("member_ids", []).append(m)
+                extra.extend(_signals(oc))
+                extra.extend(oc.get("_extra_signals") or [])
+                for m in _members(oc):
+                    MEMBER_TO_CASE[str(m)] = primary
+        if str(rid) not in [str(x) for x in _members(case)]:
+            case.setdefault("member_ids", []).append(rid)
+        case["_extra_signals"] = list(set(extra) | set(signals))
+        case_id = primary
+    else:
+        case_id = "CASE-LIVE-%d" % rid
+        cases_db[case_id] = {
+            "case_id": case_id,
+            "type": "cluster",
+            "tier": "WATCH",
+            "case_score": 0.0,
+            "max_risk": 0.0,
+            "avg_risk": 0.0,
+            "n_members": 1,
+            "n_sellers": 1,
+            "n_accounts": 1,
+            "signal_diversity": 0,
+            "signal_types": "none",
+            "time_span_minutes": 0.0,
+            "explanation": "",
+            "member_ids": [rid],
+            "_extra_signals": list(signals),
+        }
+
+    for m in members:
+        MEMBER_TO_CASE[str(m)] = case_id
+    MEMBER_TO_CASE[str(rid)] = case_id
+
+    _refresh_case(case_id)
+    case = cases_db.get(case_id) or {}
+    elapsed = (time.perf_counter() - start) * 1000
+
+    return {
+        "review_id": rid,
+        "merged_into_cluster": bool(result["merged"]),
+        "cluster_size": result["cluster_size"],
+        "case_id": case_id,
+        "tier": case.get("tier"),
+        "risk_score": risk,
+        "signals": signals,
+        "latency_ms": round(elapsed, 2),
+        "message": ("Merged into %s — tier=%s, size=%d, %.1fms."
+                    % (case_id, case.get("tier"),
+                       result["cluster_size"], elapsed)),
+    }
+
+
+# --- 9. wrapper so every other caller still goes through the bridge ------
+_V55_INVOKE = _invoke_ingest
+
+
+def _post_ingest(payload, result, before):
+    d = _as_result_dict(result)
+    rid = d.get("review_id") or d.get("rid")
+    if rid is None:
+        sr = d.get("scored_review")
+        if isinstance(sr, dict):
+            rid = sr.get("review_id")
+    if rid is None:
+        return
+
+    rid = str(rid)
+    rec = REVIEW_INDEX.get(rid)
+    if not isinstance(rec, dict):
+        return
+
+    if rec.get("risk_score") is None:
+        rec["risk_score"] = _live_risk(payload)
+    rec["account_age_hours"] = _num(payload.get("account_age_hours"))
+
+    cid = MEMBER_TO_CASE.get(rid) or _resolve_case(result, before)
+    if not cid:
+        return
+    MEMBER_TO_CASE[rid] = cid
+    extra = d.get("signals")
+    _refresh_case(cid, extra if isinstance(extra, (list, tuple, set)) else [])
+
+
+async def _invoke_ingest(payload):
+    payload = _coerce_payload(payload)
+    before = _case_snapshot()
+    globals()["_LAST_BEFORE"] = before
+    result = await _V55_INVOKE(payload)
+    try:
+        _post_ingest(payload, result, before)
+    except Exception as exc:
+        print("[console-api] v6 post-ingest failed:", type(exc).__name__, exc)
+    return result
+
+
+# --- 10. dashboard-facing endpoints --------------------------------------
+@app.post("/api/inject-member")
+async def api_inject_member():
+    global _last_latency_ms
+    payload = {
+        "seller_id": "SELLER-0265",
+        "account_id": "ACC-RING-LIVE-%d" % (len(REVIEW_INDEX) + 1),
+        "rating": 5,
+        "review_text": "AMAZING 10/10 MUST BUY! Best seller ever! "
+                       "Incredible quality, flawless product!",
+        "device_fingerprint": "DEV-A7F3E9C1-FAKE-RING",
+        "ip_block": "198.51.100.0/24",
+        "payment_instrument": "PAY-RING-4829",
+        "account_age_hours": 3.4,
+    }
+    before = _case_snapshot()
+    t0 = _time.perf_counter()
+    try:
+        result = await _invoke_ingest(payload)
+    except Exception as exc:
+        return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+
+    _last_latency_ms = round((_time.perf_counter() - t0) * 1000, 1)
+    rid = _lookup_rid(result)
+    cid = (MEMBER_TO_CASE.get(str(rid)) if rid is not None else None) \
+          or _resolve_case(result, before)
+    case = cases_db.get(cid) if cid else None
+    return {
+        "ok": True,
+        "case_id": cid,
+        "member_count": len(_members(case)) if case else 0,
+        "tier": _norm_tier(case.get("tier")) if case else "Watch",
+        "latency_ms": _last_latency_ms,
+    }
+
+
+@app.post("/api/custom/review")
+async def api_custom_review(payload: dict):
+    global _last_latency_ms
+    payload = _coerce_payload(payload or {})
+
+    if payload.get("seller_id"):
+        err = _check_seller(payload["seller_id"])
+        if err:
+            return {"ok": False, "error": err}
+
+    before = _case_snapshot()
+    t0 = _time.perf_counter()
+    try:
+        result = await _invoke_ingest(payload)
+    except Exception as exc:
+        return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+
+    _last_latency_ms = round((_time.perf_counter() - t0) * 1000, 1)
+    rid = _lookup_rid(result)
+    cid = (MEMBER_TO_CASE.get(str(rid)) if rid is not None else None) \
+          or _resolve_case(result, before)
+    case = cases_db.get(cid) if cid else None
+
+    rec = REVIEW_INDEX.get(str(rid)) if rid is not None else None
+    risk = rec.get("risk_score") if isinstance(rec, dict) else None
+    if risk is None and case is not None:
+        risk = case.get("max_risk")
+    risk = _num(risk, 0.0) or 0.0
+
+    text = str(payload.get("review_text") or payload.get("text_") or "")
+    _promo, kw = _promo_score(text)
+
+    return {
+        "ok": True,
+        "scored_review": {
+            "review_id": rid,
+            "risk_score": _score_100_review(risk),
+            "model_probability": round(risk, 4),
+            "promo_keywords": kw,
+        },
+        "assigned_case_id": cid,
+        "case_tier": _norm_tier(case.get("tier")) if case else "Watch",
+        "latency_ms": _last_latency_ms,
+    }
+
+
+@app.post("/api/custom/ring")
+async def api_custom_ring(payload: dict):
+    global _last_latency_ms
+    payload = payload or {}
+
+    n = max(3, min(20, int(_num(payload.get("num_accounts"), 6) or 6)))
+    seller = payload.get("seller_id") or "SELLER-0265"
+    err = _check_seller(seller)
+    if err:
+        return {"ok": False, "error": err}
+
+    text = (payload.get("review_text")
+            or "UNBELIEVABLE 10/10 MUST BUY!!! Absolute game changer, "
+               "best purchase ever, highly recommend.")
+    infra = _fresh_ring_infra()
+
+    before = _case_snapshot()
+    t0 = _time.perf_counter()
+    result = None
+    try:
+        for i in range(n):
+            result = await _invoke_ingest(_ring_payload(
+                "CUSTOM-%s" % infra["tag"], seller, text, infra,
+                1.5 + i * 0.2, i))
+    except Exception as exc:
+        return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+
+    _last_latency_ms = round((_time.perf_counter() - t0) * 1000, 1)
+    cid = _resolve_case(result, before)
+    case = cases_db.get(cid) if cid else None
+    raw = float(case.get("case_score") or 0.0) if case else 0.0
+
+    return {
+        "ok": True,
+        "ring_tag": infra["tag"],
+        "case_id": cid,
+        "member_count": len(_members(case)) if case else 0,
+        "tier": _norm_tier(case.get("tier")) if case else "Watch",
+        "case_score_100": _score_100(raw),
+        "fragments": 1 if cid else 0,
+        "latency_ms": _last_latency_ms,
+    }
+
+
+@app.post("/api/stress-test/inject")
+async def api_stress_test_inject(body: dict = None):
+    global _last_latency_ms
+    body = body or {}
+
+    seller = body.get("seller_id") or "SELLER-0265"
+    err = _check_seller(seller)
+    if err:
+        return {"ok": False, "error": err}
+
+    infra = _fresh_ring_infra()
+    text = "AMAZING 10/10 MUST BUY! Best seller ever!"
+
+    before = _case_snapshot()
+    t0 = _time.perf_counter()
+    result = None
+    try:
+        for i in range(8):
+            result = await _invoke_ingest(_ring_payload(
+                "APEX-%s" % infra["tag"], seller, text, infra,
+                2.0 + i * 0.3, i))
+    except Exception as exc:
+        return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+
+    _last_latency_ms = round((_time.perf_counter() - t0) * 1000, 1)
+    cid = _resolve_case(result, before)
+    case = cases_db.get(cid) if cid else None
+    return {
+        "ok": True,
+        "ring_tag": infra["tag"],
+        "case_id": cid,
+        "member_count": len(_members(case)) if case else 0,
+        "tier": _norm_tier(case.get("tier")) if case else "Watch",
+        "latency_ms": _last_latency_ms,
+    }
+
+
+# --- 11. evaluation (fixes the _out NameError) ---------------------------
+@app.get("/api/evaluation")
+def api_evaluation():
+    ring_case = cases_db.get("CASE-0000") or {}
+    ring_rids = set(_members(_BASELINE_CASES.get("CASE-0000") or ring_case))
+    n_pos = len(ring_rids) or 7
+
+    ranked = [r["review_id"] for r in FEED_CACHE]
+    p_at_k, r_at_k = {}, {}
+    for k in (5, 10, 20, 50):
+        tp = len(set(ranked[:k]) & ring_rids)
+        p_at_k["P@%d" % k] = round(tp / k, 3)
+        r_at_k["R@%d" % k] = round(tp / n_pos, 3)
+
+    ring_cases = [cid for cid, c in cases_db.items()
+                  if set(_members(c)) & ring_rids]
+    top_overlap = max((len(set(_members(cases_db[cid])) & ring_rids)
+                       for cid in ring_cases), default=0)
+    link_rate = round(top_overlap / n_pos, 3)
+
+    api_rows = [_case_to_api(cid, c) for cid, c in list(cases_db.items())[:200]]
+    explained = sum(1 for r in api_rows if r["explanation_summary"].strip())
+
+    out = {
+        "precision_at_k": p_at_k,
+        "recall_at_k": r_at_k,
+        "ring_members_ground_truth": n_pos,
+        "ring_cases_found": len(ring_cases),
+        "ring_linking_rate": link_rate,
+        "fragmentation_rate": (0.0 if len(ring_cases) == 1
+                               else round(1 - 1 / max(1, len(ring_cases)), 3)),
+        "stress_test_pass": bool(link_rate == 1.0 and len(ring_cases) == 1),
+        "explainability_coverage_pct": round(
+            explained / max(1, len(api_rows)) * 100, 1),
+        "text_model": {"available": False},
+    }
+
+    try:
+        import text_model
+        tm = text_model.model_info()
+        out["text_model"] = {
+            "available": bool(tm.get("available")),
+            "auc": tm.get("auc"),
+            "accuracy": tm.get("accuracy"),
+            "split": tm.get("split"),
+            "n_total": tm.get("n_total"),
+            "n_test": tm.get("n_test"),
+            "caveat": tm.get("caveat"),
+        }
+    except Exception:
+        pass
+
+    return out
+
+
+# --- 12. feed rebuild ----------------------------------------------------
+def _build_feed_cache():
+    global FEED_CACHE
+    rows = []
+    for rid, info in REVIEW_INDEX.items():
+        raw = _num(info.get("risk_score"), 0.0) or 0.0
+        rows.append({
+            "review_id": rid,
+            "risk_score": _score_100_review(raw),
+            "raw_risk": round(raw, 4),
+            "seller_id": info.get("seller_id") or "—",
+            "account_id": info.get("account_id") or "—",
+            "rating": info.get("rating") or 0,
+            "review_text": info.get("text") or "",
+            "triggered_rules": info.get("rules") or [],
+        })
+    rows.sort(key=lambda r: r["raw_risk"], reverse=True)
+    FEED_CACHE = rows
+    print("[console-api] feed cached:", len(rows))
+
+
+@app.get("/api/reviews")
+def api_reviews(limit: int = 80, flagged_only: bool = False):
+    rows = FEED_CACHE
+    if flagged_only:
+        rows = [r for r in rows if r["risk_score"] >= 35 or r["triggered_rules"]]
+    return {"reviews": rows[:limit], "total": len(rows)}
+
+
+_build_feed_cache()
+print("[console-api] v6.1 ready — full-payload ingest, real scoring, isolated rings")
+
     
+# ============================================================================
+# console-api v6.2 — Judge Test Lab
+# ----------------------------------------------------------------------------
+# Six preset rings, each with fresh infrastructure and a unique run tag, so
+# running one does not contaminate the next. Each run reports PASS/FAIL
+# against a stated goal. Also exposes /api/judge-lab/presets for the UI.
+# ============================================================================
+
+_LAB_PRESETS = [
+    {
+        "id": "classic",
+        "name": "Classic ring",
+        "description": "Same device, IP and payment. The textbook coordinated ring.",
+        "members": 8,
+        "shares": ["device", "ip", "payment"],
+        "sellers": 1,
+        "spacing_seconds": 30,
+        "min_tier": "Escalate",
+        "goal": "PASS at Escalate",
+        "text": "UNBELIEVABLE 10/10 MUST BUY!!! Absolute game changer, best purchase I have ever made.",
+    },
+    {
+        "id": "two_signals",
+        "name": "Two shared signals",
+        "description": "Only device and IP are shared — payment differs. Text and timing carry the rest.",
+        "members": 8,
+        "shares": ["device", "ip"],
+        "sellers": 1,
+        "spacing_seconds": 30,
+        "min_tier": "Review",
+        "goal": "PASS at Review or Escalate",
+        "text": "Absolutely flawless product. Best purchase I have made this year.",
+    },
+    {
+        "id": "one_signal",
+        "name": "One shared signal",
+        "description": "Only device is shared. Text, timing and fresh accounts must bridge the rest.",
+        "members": 8,
+        "shares": ["device"],
+        "sellers": 1,
+        "spacing_seconds": 30,
+        "min_tier": "Review",
+        "goal": "PASS at Review or Escalate",
+        "text": "Superb quality. Exceeded expectations on every front.",
+    },
+    {
+        "id": "no_hardware",
+        "name": "No shared hardware",
+        "description": "No device, IP or payment in common. Text, seller and account age carry the link.",
+        "members": 8,
+        "shares": [],
+        "sellers": 1,
+        "spacing_seconds": 60,
+        "min_tier": "Review",
+        "goal": "PASS at Review or Escalate",
+        "text": "Highly recommend. Stellar service, top quality, will buy again.",
+    },
+    {
+        "id": "slow_spread",
+        "name": "Slow and spread out",
+        "description": "Six reviews over 12-hour intervals. Text and fresh accounts only — no timing signal.",
+        "members": 6,
+        "shares": [],
+        "sellers": 1,
+        "spacing_seconds": 43200,
+        "min_tier": "Review",
+        "goal": "PASS at Review (Escalate unlikely — signals weaken with time)",
+        "text": "Great product, arrived quickly, works as expected.",
+    },
+    {
+        "id": "cross_seller",
+        "name": "Cross-seller ring",
+        "description": "Nine reviews across three sellers, sharing device and IP.",
+        "members": 9,
+        "shares": ["device", "ip"],
+        "sellers": 3,
+        "spacing_seconds": 45,
+        "min_tier": "Review",
+        "goal": "PASS at Review or Escalate",
+        "text": "Amazing service, product exactly as shown, five stars.",
+    },
+]
+
+
+def _lab_sellers(n):
+    pool = sorted(_seller_id_set())
+    if not pool:
+        return []
+    out = list(pool[:n])
+    while len(out) < n:
+        out.append(pool[len(out) % len(pool)])
+    return out[:n]
+
+
+@app.get("/api/judge-lab/presets")
+def api_lab_presets():
+    return {
+        "presets": [
+            {k: v for k, v in p.items() if k != "text"}
+            for p in _LAB_PRESETS
+        ]
+    }
+
+
+@app.post("/api/judge-lab/run")
+async def api_lab_run(body: dict = None):
+    body = body or {}
+    preset_id = str(body.get("preset") or "").strip()
+    preset = next((p for p in _LAB_PRESETS if p["id"] == preset_id), None)
+    if preset is None:
+        return {"ok": False, "error": "unknown preset %r" % preset_id}
+
+    sellers = _lab_sellers(preset.get("sellers", 1))
+    if not sellers:
+        return {"ok": False, "error":
+                "no sellers loaded — is enriched_reviews.csv present?"}
+
+    infra = _fresh_ring_infra()
+    run_tag = infra["tag"]
+    text = preset["text"] + " [" + run_tag + "]"
+    shares = set(preset["shares"])
+    spacing = float(preset["spacing_seconds"])
+    base_ts = time.time() - (preset["members"] - 1) * spacing
+
+    rids = []
+    t0 = time.perf_counter()
+    try:
+        for i in range(preset["members"]):
+            seller = sellers[i % len(sellers)]
+            ts = base_ts + i * spacing
+            payload = {
+                "seller_id": seller,
+                "account_id": "ACC-LAB-%s-%02d" % (run_tag, i),
+                "rating": 5,
+                "review_text": text,
+                "text_": text,
+                "device_fingerprint": infra["device_fingerprint"] if "device" in shares else None,
+                "ip_block": infra["ip_block"] if "ip" in shares else None,
+                "payment_instrument": infra["payment_instrument"] if "payment" in shares else None,
+                "account_age_hours": 2.0 + i * 0.1,
+                "timestamp": ts,
+            }
+            result = await _invoke_ingest(payload)
+            rid = _lookup_rid(result)
+            if rid is not None:
+                rids.append(str(rid))
+    except Exception as exc:
+        return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+
+    mapped = {MEMBER_TO_CASE.get(r) for r in rids}
+    mapped.discard(None)
+    primary_cid = next(iter(mapped)) if len(mapped) == 1 else None
+    primary = cases_db.get(primary_cid) if primary_cid else None
+
+    ring_in_case = (sum(1 for r in rids if MEMBER_TO_CASE.get(r) == primary_cid)
+                    if primary_cid else 0)
+    total_members = len(_members(primary)) if primary else 0
+
+    tier = _norm_tier(primary.get("tier")) if primary else "Watch"
+    rank = {"Watch": 0, "Review": 1, "Escalate": 2}
+    tier_ok = rank.get(tier, 0) >= rank.get(preset["min_tier"], 0)
+    time_ok = elapsed_ms < 5000
+    one_case = len(mapped) == 1 and ring_in_case == len(rids)
+    all_pass = one_case and tier_ok and time_ok
+
+    case_score_100 = _score_100(primary.get("case_score") or 0) if primary else 0
+    signals = _signals(primary) if primary else []
+
+    print("[judge-lab] %s: %d members → %d case(s), tier=%s, %.0fms, %s"
+          % (preset_id, len(rids), len(mapped), tier, elapsed_ms,
+             "PASS" if all_pass else "FAIL"))
+
+    return {
+        "ok": True,
+        "preset": preset_id,
+        "ring_tag": run_tag,
+        "case_id": primary_cid,
+        "ring_member_count": len(rids),
+        "ring_members_in_case": ring_in_case,
+        "total_members_in_case": total_members,
+        "fragments": len(mapped),
+        "tier": tier,
+        "min_tier": preset["min_tier"],
+        "case_score_100": case_score_100,
+        "elapsed_ms": round(elapsed_ms, 1),
+        "signals": signals,
+        "checks": {
+            "one_case": one_case,
+            "tier_ok": tier_ok,
+            "time_ok": time_ok,
+        },
+        "pass": all_pass,
+        "goal": preset["goal"],
+    }
+
+try:
+    import text_model as _tm_boot
+    _tm_boot._load()
+    print("[console-api] text model warmed at boot")
+except Exception as _e:
+    print("[console-api] text model not warmed:", type(_e).__name__)
+
+print("[console-api] v6.2 ready — Judge Test Lab")
+
+# ============================================================================
+# console-api v6.3 — seller alias resolution
+# ----------------------------------------------------------------------------
+# Fixes the Test tab: SEL_003 and other legacy ids resolve to a real seller
+# instead of being rejected. Resolution order:
+#   exact  ->  case-insensitive  ->  numeric-suffix alias (SEL_003 -> SELLER-0003)
+#   ->  default demo seller for SEL_/SELLER_ shaped ids that do not exist
+# Truly malformed ids (SELLER-NOT-A-REAL-ID-9999) are still rejected.
+# ============================================================================
+
+import re as _re
+
+_SELLER_INDEX = {"ids": None, "n": -1, "lower": {}, "tail": {},
+                 "counts": {}, "top": None}
+
+_DEFAULT_SELLER = "SELLER-0265"
+
+
+def _seller_index():
+    """sellers keyed for fast resolution, rebuilt when the index grows."""
+    n = len(REVIEW_INDEX)
+    if _SELLER_INDEX["ids"] is not None and _SELLER_INDEX["n"] == n:
+        return _SELLER_INDEX
+
+    counts = {}
+    for rec in REVIEW_INDEX.values():
+        if isinstance(rec, dict):
+            s = rec.get("seller_id")
+            if s:
+                s = str(s).strip()
+                if s:
+                    counts[s] = counts.get(s, 0) + 1
+
+    ids = set(counts)
+    lower = {s.lower(): s for s in ids}
+    tail = {}
+    for s in ids:
+        m = _re.search(r"(\d+)\s*$", s)
+        if m:
+            tail.setdefault(int(m.group(1)), s)
+    top = max(counts, key=lambda k: counts[k]) if counts else None
+
+    _SELLER_INDEX.update({"ids": ids, "n": n, "lower": lower,
+                          "tail": tail, "counts": counts, "top": top})
+    if ids:
+        print("[console-api] known sellers:", len(ids))
+    return _SELLER_INDEX
+
+
+def _default_seller():
+    idx = _seller_index()
+    for cand in (_DEFAULT_SELLER, idx.get("top")):
+        if cand and cand in idx["ids"]:
+            return cand
+    return idx.get("top")
+
+
+def _seller_id_set():
+    """Kept for the Judge Lab, which picks real sellers from this set."""
+    return _seller_index()["ids"]
+
+
+def _resolve_seller(sid, allow_fallback=True):
+    """-> (canonical_id, note) ; note is None when it matched exactly.
+       -> (None, error_message) when it cannot be resolved."""
+    idx = _seller_index()
+    ids = idx["ids"]
+
+    raw = str(sid or "").strip()
+
+    if not ids:
+        return (raw or _DEFAULT_SELLER,
+                "seller index empty — id passed through unchanged")
+
+    if not raw:
+        d = _default_seller()
+        return d, "no seller supplied; defaulted to %s" % d
+
+    if raw in ids:
+        return raw, None
+
+    hit = idx["lower"].get(raw.lower())
+    if hit:
+        return hit, "matched %r by case-insensitive id" % raw
+
+    m = _re.search(r"(\d+)\s*$", raw)
+    if m:
+        hit = idx["tail"].get(int(m.group(1)))
+        if hit:
+            return hit, "matched %r to %s by numeric suffix" % (raw, hit)
+
+    # Legacy SEL_003 / SELLER_003 shape whose number is absent from the set:
+    # substitute the default demo seller rather than failing the demo button.
+    alias_shaped = bool(_re.match(r"^(sel|seller)[-_]?\d+$", raw.lower()))
+    if allow_fallback and alias_shaped:
+        d = _default_seller()
+        if d:
+            return d, "unknown seller %r; substituted default %s" % (raw, d)
+
+    sample = ", ".join(sorted(ids)[:3])
+    return None, ("Unknown seller %r. Use one that exists in the dataset, "
+                  "for example %s." % (raw, sample))
+
+
+def _seller_or_error(sid):
+    canonical, note = _resolve_seller(sid)
+    if canonical is None:
+        return None, None, note
+    return canonical, note, None
+
+
+# --- re-register the three test endpoints with resolution ------------------
+app.router.routes = [r for r in app.router.routes
+                     if getattr(r, "path", None) not in {
+                         "/api/custom/review",
+                         "/api/custom/ring",
+                         "/api/stress-test/inject",
+                         "/api/inject-member",
+                     }]
+
+
+@app.post("/api/custom/review")
+async def api_custom_review(payload: dict):
+    global _last_latency_ms
+    payload = _coerce_payload(payload or {})
+
+    canonical, note, err = _seller_or_error(payload.get("seller_id"))
+    if err:
+        return {"ok": False, "error": err}
+    payload["seller_id"] = canonical
+
+    before = _case_snapshot()
+    t0 = _time.perf_counter()
+    try:
+        result = await _invoke_ingest(payload)
+    except Exception as exc:
+        return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+
+    _last_latency_ms = round((_time.perf_counter() - t0) * 1000, 1)
+    rid = _lookup_rid(result)
+    cid = (MEMBER_TO_CASE.get(str(rid)) if rid is not None else None) \
+          or _resolve_case(result, before)
+    case = cases_db.get(cid) if cid else None
+
+    rec = REVIEW_INDEX.get(str(rid)) if rid is not None else None
+    risk = rec.get("risk_score") if isinstance(rec, dict) else None
+    if risk is None and case is not None:
+        risk = case.get("max_risk")
+    risk = _num(risk, 0.0) or 0.0
+
+    text = str(payload.get("review_text") or payload.get("text_") or "")
+    _promo, kw = _promo_score(text)
+
+    out = {
+        "ok": True,
+        "seller_id": canonical,
+        "scored_review": {
+            "review_id": rid,
+            "risk_score": _score_100_review(risk),
+            "model_probability": round(risk, 4),
+            "promo_keywords": kw,
+        },
+        "assigned_case_id": cid,
+        "case_tier": _norm_tier(case.get("tier")) if case else "Watch",
+        "latency_ms": _last_latency_ms,
+    }
+    if note:
+        out["seller_note"] = note
+    return out
+
+
+@app.post("/api/custom/ring")
+async def api_custom_ring(payload: dict):
+    global _last_latency_ms
+    payload = payload or {}
+
+    n = max(3, min(20, int(_num(payload.get("num_accounts"), 6) or 6)))
+    canonical, note, err = _seller_or_error(payload.get("seller_id"))
+    if err:
+        return {"ok": False, "error": err}
+
+    text = (payload.get("review_text")
+            or "UNBELIEVABLE 10/10 MUST BUY!!! Absolute game changer, "
+               "best purchase ever, highly recommend.")
+    infra = _fresh_ring_infra()
+
+    before = _case_snapshot()
+    t0 = _time.perf_counter()
+    result = None
+    try:
+        for i in range(n):
+            result = await _invoke_ingest(_ring_payload(
+                "CUSTOM-%s" % infra["tag"], canonical, text, infra,
+                1.5 + i * 0.2, i))
+    except Exception as exc:
+        return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+
+    _last_latency_ms = round((_time.perf_counter() - t0) * 1000, 1)
+    cid = _resolve_case(result, before)
+    case = cases_db.get(cid) if cid else None
+    raw = float(case.get("case_score") or 0.0) if case else 0.0
+
+    out = {
+        "ok": True,
+        "seller_id": canonical,
+        "ring_tag": infra["tag"],
+        "case_id": cid,
+        "member_count": len(_members(case)) if case else 0,
+        "tier": _norm_tier(case.get("tier")) if case else "Watch",
+        "case_score_100": _score_100(raw),
+        "fragments": 1 if cid else 0,
+        "latency_ms": _last_latency_ms,
+    }
+    if note:
+        out["seller_note"] = note
+    return out
+
+
+@app.post("/api/stress-test/inject")
+async def api_stress_test_inject(body: dict = None):
+    global _last_latency_ms
+    body = body or {}
+
+    canonical, note, err = _seller_or_error(body.get("seller_id"))
+    if err:
+        return {"ok": False, "error": err}
+
+    infra = _fresh_ring_infra()
+    text = "AMAZING 10/10 MUST BUY! Best seller ever!"
+
+    before = _case_snapshot()
+    t0 = _time.perf_counter()
+    result = None
+    try:
+        for i in range(8):
+            result = await _invoke_ingest(_ring_payload(
+                "APEX-%s" % infra["tag"], canonical, text, infra,
+                2.0 + i * 0.3, i))
+    except Exception as exc:
+        return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+
+    _last_latency_ms = round((_time.perf_counter() - t0) * 1000, 1)
+    cid = _resolve_case(result, before)
+    case = cases_db.get(cid) if cid else None
+
+    out = {
+        "ok": True,
+        "seller_id": canonical,
+        "ring_tag": infra["tag"],
+        "case_id": cid,
+        "member_count": len(_members(case)) if case else 0,
+        "tier": _norm_tier(case.get("tier")) if case else "Watch",
+        "latency_ms": _last_latency_ms,
+    }
+    if note:
+        out["seller_note"] = note
+    return out
+
+
+@app.post("/api/inject-member")
+async def api_inject_member():
+    global _last_latency_ms
+    seller = _default_seller() or _DEFAULT_SELLER
+
+    payload = {
+        "seller_id": seller,
+        "account_id": "ACC-RING-LIVE-%d" % (len(REVIEW_INDEX) + 1),
+        "rating": 5,
+        "review_text": "AMAZING 10/10 MUST BUY! Best seller ever! "
+                       "Incredible quality, flawless product!",
+        "device_fingerprint": "DEV-A7F3E9C1-FAKE-RING",
+        "ip_block": "198.51.100.0/24",
+        "payment_instrument": "PAY-RING-4829",
+        "account_age_hours": 3.4,
+    }
+
+    before = _case_snapshot()
+    t0 = _time.perf_counter()
+    try:
+        result = await _invoke_ingest(payload)
+    except Exception as exc:
+        return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+
+    _last_latency_ms = round((_time.perf_counter() - t0) * 1000, 1)
+    rid = _lookup_rid(result)
+    cid = (MEMBER_TO_CASE.get(str(rid)) if rid is not None else None) \
+          or _resolve_case(result, before)
+    case = cases_db.get(cid) if cid else None
+    return {
+        "ok": True,
+        "case_id": cid,
+        "member_count": len(_members(case)) if case else 0,
+        "tier": _norm_tier(case.get("tier")) if case else "Watch",
+        "latency_ms": _last_latency_ms,
+    }
+
+
+# --- inspection + dropdown source ----------------------------------------
+@app.get("/api/sellers")
+def api_sellers(limit: int = 40):
+    idx = _seller_index()
+    counts = idx.get("counts") or {}
+    rows = sorted(idx["ids"], key=lambda s: (-counts.get(s, 0), s))
+    return {
+        "sellers": rows[:max(1, min(500, limit))],
+        "total": len(idx["ids"]),
+        "default": _default_seller(),
+    }
+
+
+@app.get("/api/debug/sellers")
+def api_debug_sellers():
+    return {
+        "n_sellers": len(_seller_index()["ids"]),
+        "default": _default_seller(),
+        "sample": sorted(_seller_index()["ids"])[:10],
+        "SEL_003_resolves_to": _resolve_seller("SEL_003"),
+        "SELLER-NOT-A-REAL-ID-9999": _resolve_seller("SELLER-NOT-A-REAL-ID-9999"),
+    }
+
+
+print("[console-api] v6.3 ready — seller aliases resolve")
+
 if __name__ == "__main__":
     import uvicorn
     print("\n🚀 TrustNet API on http://127.0.0.1:8000")

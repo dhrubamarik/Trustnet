@@ -454,7 +454,8 @@
   <button class="tab" role="tab" data-view="test"  aria-selected="false"><span class="idx">02</span>Test</button>
   <button class="tab" role="tab" data-view="feed"  aria-selected="false"><span class="idx">03</span>Feed</button>
   <button class="tab" role="tab" data-view="arch"  aria-selected="false"><span class="idx">04</span>Architecture</button>
-    <button class="tab" role="tab" data-view="assistant" aria-selected="false"><span class="idx">05</span>Assistant</button>
+  <button class="tab" role="tab" data-view="assistant" aria-selected="false"><span class="idx">05</span>Assistant</button>
+  <button class="tab" role="tab" data-view="lab" aria-selected="false" ><span class="idx">06</span>Judge Lab</button>
 </nav>
 
 <main>
@@ -552,7 +553,7 @@
         <div class="section">
           <div class="field">
             <label class="field-label" for="inSeller">Seller ID</label>
-            <input class="input" id="inSeller" type="text" value="SEL_003">
+            <input class="input" id="inSeller" type="text" value="SELLER-0265">
           </div>
           <div class="field">
             <label class="field-label" for="inText">Review Text</label>
@@ -683,6 +684,504 @@
       <button type="submit">Send</button>
     </form>
   </div>
+</section>
+
+<!-- ============ 06 Judge lab ============ -->
+ <section data-view-panel="lab">
+ <style>
+  /* Dark- and light-safe. Surfaces use --surface-2 (present in both themes);
+     fallback is a neutral translucent tint. Text inherits from the active
+     theme so it can never become invisible. */
+  [data-view-panel="lab"] .lab-wrap {
+    padding: 20px 28px 40px;
+    max-width: 980px;
+    color: inherit;
+  }
+
+  [data-view-panel="lab"] .lab-card {
+    background: var(--surface-2, rgba(127, 127, 127, 0.08));
+    border: 1px solid rgba(127, 127, 127, 0.18);
+    border-radius: 10px;
+    padding: 20px 24px;
+    margin-bottom: 18px;
+    color: inherit;
+  }
+
+  [data-view-panel="lab"] .lab-card h3 {
+    margin: 0 0 14px;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-weight: 600;
+    color: inherit;
+    opacity: 0.6;
+  }
+
+  [data-view-panel="lab"] .lab-steps {
+    display: grid;
+    gap: 10px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  [data-view-panel="lab"] .lab-steps li {
+    padding-left: 30px;
+    position: relative;
+    font-size: 13px;
+    line-height: 1.5;
+    color: inherit;
+  }
+
+  [data-view-panel="lab"] .lab-steps li::before {
+    content: attr(data-n);
+    position: absolute;
+    left: 0;
+    top: 1px;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background: rgba(59, 130, 246, 0.18);
+    color: #60a5fa;
+    font-size: 11px;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  [data-view-panel="lab"] .lab-rule {
+    margin-top: 16px;
+    padding: 12px 14px;
+    background: rgba(127, 127, 127, 0.08);
+    border-radius: 8px;
+    font-size: 12px;
+    line-height: 1.6;
+    color: inherit;
+    opacity: 0.88;
+    border-left: 3px solid #3b82f6;
+  }
+
+  [data-view-panel="lab"] .lab-controls {
+    display: flex;
+    gap: 10px;
+    align-items: stretch;
+    flex-wrap: wrap;
+  }
+
+  [data-view-panel="lab"] .lab-controls select {
+    flex: 1 1 320px;
+    padding: 9px 12px;
+    font-size: 13px;
+    border-radius: 8px;
+    border: 1px solid rgba(127, 127, 127, 0.28);
+    background: rgba(127, 127, 127, 0.08);
+    color: inherit;
+    font-family: inherit;
+  }
+
+  [data-view-panel="lab"] .lab-controls button {
+    padding: 9px 22px;
+    font-size: 13px;
+    font-weight: 500;
+    border-radius: 8px;
+    border: 0;
+    cursor: pointer;
+    font-family: inherit;
+  }
+
+  [data-view-panel="lab"] .lab-btn-primary {
+    background: #2563eb;
+    color: #ffffff;
+  }
+
+  [data-view-panel="lab"] .lab-btn-primary:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  [data-view-panel="lab"] .lab-btn-secondary {
+    background: transparent;
+    color: inherit;
+    border: 1px solid rgba(127, 127, 127, 0.28) !important;
+  }
+
+  [data-view-panel="lab"] .lab-desc {
+    font-size: 12px;
+    color: inherit;
+    opacity: 0.6;
+    margin-top: 12px;
+  }
+
+  [data-view-panel="lab"] .lab-result { display: none; }
+  [data-view-panel="lab"] .lab-result.shown { display: block; }
+
+  [data-view-panel="lab"] .lab-badge {
+    display: inline-block;
+    padding: 5px 12px;
+    border-radius: 20px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    background: rgba(127, 127, 127, 0.12);
+    color: inherit;
+  }
+
+  [data-view-panel="lab"] .lab-badge.pass {
+    background: rgba(34, 197, 94, 0.18);
+    color: #22c55e;
+  }
+
+  [data-view-panel="lab"] .lab-badge.fail {
+    background: rgba(239, 68, 68, 0.18);
+    color: #ef4444;
+  }
+
+  [data-view-panel="lab"] .lab-badge.pending {
+    background: rgba(127, 127, 127, 0.12);
+    color: inherit;
+    opacity: 0.7;
+  }
+
+  [data-view-panel="lab"] .lab-checks {
+    margin: 16px 0 0;
+    padding: 0;
+    list-style: none;
+    display: grid;
+    gap: 8px;
+  }
+
+  [data-view-panel="lab"] .lab-checks li {
+    font-size: 13px;
+    line-height: 1.5;
+    color: inherit;
+  }
+
+  [data-view-panel="lab"] .lab-checks li .ok {
+    color: #22c55e;
+    margin-right: 8px;
+    font-weight: 700;
+  }
+
+  [data-view-panel="lab"] .lab-checks li .no {
+    color: #ef4444;
+    margin-right: 8px;
+    font-weight: 700;
+  }
+
+  [data-view-panel="lab"] .lab-meta {
+    margin-top: 16px;
+    padding-top: 16px;
+    border-top: 1px solid rgba(127, 127, 127, 0.18);
+    display: flex;
+    gap: 24px;
+    flex-wrap: wrap;
+    font-size: 12px;
+    color: inherit;
+  }
+
+  [data-view-panel="lab"] .lab-meta > div > span {
+    display: block;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    opacity: 0.55;
+    margin-bottom: 2px;
+  }
+
+  [data-view-panel="lab"] .lab-meta strong {
+    font-weight: 500;
+    font-size: 13px;
+    color: inherit;
+    opacity: 1;
+  }
+
+  [data-view-panel="lab"] .lab-chips {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-top: 6px;
+  }
+
+  [data-view-panel="lab"] .lab-chip {
+    padding: 3px 10px;
+    border-radius: 12px;
+    background: rgba(127, 127, 127, 0.12);
+    border: 1px solid rgba(127, 127, 127, 0.22);
+    font-size: 11px;
+    color: inherit;
+  }
+
+  [data-view-panel="lab"] .lab-scoreboard {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+    font-size: 12px;
+    margin-top: 14px;
+  }
+
+  [data-view-panel="lab"] .lab-scoreboard th {
+    text-align: left;
+    padding: 8px 10px;
+    font-weight: 500;
+    color: inherit;
+    opacity: 0.55;
+    border-bottom: 1px solid rgba(127, 127, 127, 0.18);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  [data-view-panel="lab"] .lab-scoreboard td {
+    padding: 10px;
+    border-bottom: 1px solid rgba(127, 127, 127, 0.12);
+    color: inherit;
+  }
+
+  [data-view-panel="lab"] .lab-scoreboard tr:last-child td {
+    border-bottom: 0;
+  }
+
+  [data-view-panel="lab"] .lab-scoreboard .cell-pass {
+    color: #22c55e;
+    font-weight: 600;
+  }
+
+  [data-view-panel="lab"] .lab-scoreboard .cell-fail {
+    color: #ef4444;
+    font-weight: 600;
+  }
+
+  [data-view-panel="lab"] .lab-actions {
+    display: flex;
+    gap: 10px;
+  }
+
+  [data-view-panel="lab"] .lab-hint {
+    margin-top: 16px;
+    padding: 12px 14px;
+    background: rgba(127, 127, 127, 0.06);
+    border-radius: 8px;
+    font-size: 12px;
+    line-height: 1.6;
+    color: inherit;
+    opacity: 0.78;
+  }
+
+  [data-view-panel="lab"] .lab-hint strong {
+    color: inherit;
+    opacity: 1;
+  }
+</style>
+
+  <div class="lab-wrap">
+    <div class="lab-card">
+      <h3>Protocol · 2 minutes</h3>
+      <ol class="lab-steps">
+        <li data-n="1"><strong>Pick a ring type.</strong> Each simulates a different cross-signal pattern.</li>
+        <li data-n="2"><strong>Run it.</strong> Members are injected one at a time; the counter updates live.</li>
+        <li data-n="3"><strong>Check the verdict.</strong> The system either links them into one case or scatters them.</li>
+      </ol>
+      <div class="lab-rule">
+        <strong>PASS</strong> = all ring members in ONE case, tier at least the stated goal, in under 5 seconds.<br>
+        <strong>FAIL</strong> = members split across multiple cases, or tier below the goal.
+      </div>
+    </div>
+
+    <div class="lab-card">
+      <h3>Pick a ring type</h3>
+      <div class="lab-controls">
+        <select id="lab-preset-select"></select>
+        <button class="lab-btn-primary" id="lab-run-btn">Run this ring</button>
+      </div>
+      <div class="lab-desc" id="lab-preset-desc"></div>
+    </div>
+
+    <div class="lab-card lab-result" id="lab-result">
+      <h3>Verdict &nbsp;<span id="lab-badge" class="lab-badge pending">Running…</span></h3>
+      <ul class="lab-checks" id="lab-checks"></ul>
+      <div class="lab-meta" id="lab-meta"></div>
+    </div>
+
+    <div class="lab-card">
+      <h3>Scoreboard</h3>
+      <div class="lab-actions">
+        <button class="lab-btn-primary" id="lab-run-all-btn">Run all 6</button>
+        <button class="lab-btn-secondary" id="lab-clear-btn">Clear scoreboard</button>
+      </div>
+      <table class="lab-scoreboard" id="lab-scoreboard">
+        <thead>
+          <tr>
+            <th>Ring type</th><th>Members</th><th>Tier</th>
+            <th>Score</th><th>Time</th><th>Verdict</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td colspan="6" style="text-align:center; padding:24px; color:var(--text-dim, #6b7280); font-size:11px;">No runs yet</td></tr>
+        </tbody>
+      </table>
+      <div class="lab-hint">
+        <strong>Honest note.</strong> "Slow and spread out" is expected to only reach
+        <em>Review</em>, not <em>Escalate</em> — the signals weaken with time, and we say so
+        on purpose. A ring that shares <strong>nothing</strong> across all reviews and posts
+        over days with <strong>different text</strong> will not link; that is out of scope
+        and we say that too.
+      </div>
+    </div>
+  </div>
+
+  <script>
+  (function () {
+    const sel = document.getElementById("lab-preset-select");
+    const runBtn = document.getElementById("lab-run-btn");
+    const runAllBtn = document.getElementById("lab-run-all-btn");
+    const clearBtn = document.getElementById("lab-clear-btn");
+    const desc = document.getElementById("lab-preset-desc");
+    const result = document.getElementById("lab-result");
+    const badge = document.getElementById("lab-badge");
+    const checks = document.getElementById("lab-checks");
+    const meta = document.getElementById("lab-meta");
+    const scoreboardBody = document.querySelector("#lab-scoreboard tbody");
+
+    if (!sel || !runBtn) return;
+
+    let presets = [];
+    const scoreboardData = {};
+
+    async function loadPresets() {
+      try {
+        const r = await fetch("/api/judge-lab/presets");
+        const d = await r.json();
+        presets = d.presets || [];
+        sel.innerHTML = presets.map(p =>
+          `<option value="${p.id}">${p.name} — ${p.members} members</option>`
+        ).join("");
+        updateDesc();
+        sel.addEventListener("change", updateDesc);
+      } catch (e) {
+        desc.textContent = "Could not load presets: " + e.message;
+      }
+    }
+
+    function updateDesc() {
+      const p = presets.find(x => x.id === sel.value);
+      desc.textContent = p
+        ? p.description + "  ·  Goal: " + p.goal
+        : "";
+    }
+
+    function renderResult(d) {
+      badge.className = "lab-badge " + (d.pass ? "pass" : "fail");
+      badge.textContent = d.pass ? "PASS" : "FAIL";
+
+      const c = d.checks || {};
+      const fragNote = c.one_case
+        ? ""
+        : ` — split across <strong>${d.fragments}</strong> cases`;
+      const tierNote = c.tier_ok
+        ? ""
+        : ` <em>(goal: at least ${d.min_tier})</em>`;
+      checks.innerHTML = `
+        <li><span class="${c.one_case ? 'ok' : 'no'}">${c.one_case ? '✓' : '×'}</span>
+          <strong>${d.ring_members_in_case}</strong> of
+          <strong>${d.ring_member_count}</strong> ring members in
+          <strong>one case</strong>${fragNote}</li>
+        <li><span class="${c.tier_ok ? 'ok' : 'no'}">${c.tier_ok ? '✓' : '×'}</span>
+          Tier is <strong>${d.tier}</strong>${tierNote}</li>
+        <li><span class="${c.time_ok ? 'ok' : 'no'}">${c.time_ok ? '✓' : '×'}</span>
+          Completed in <strong>${Math.round(d.elapsed_ms)} ms</strong></li>
+      `;
+
+      const sigs = (d.signals || [])
+        .map(s => `<span class="lab-chip">${s}</span>`).join("");
+      meta.innerHTML = `
+        <div><span>Case</span><br><strong>${d.case_id || "—"}</strong></div>
+        <div><span>Case size</span><br><strong>${d.total_members_in_case}</strong></div>
+        <div><span>Score</span><br><strong>${d.case_score_100} / 100</strong></div>
+        <div><span>Ring tag</span><br><strong>${d.ring_tag}</strong></div>
+        <div style="flex:1 1 100%; margin-top:8px;">
+          <span>Linked by</span>
+          <div class="lab-chips">
+            ${sigs || '<span style="color:var(--text-dim, #6b7280); font-style:italic; font-size:11px;">no shared evidence</span>'}
+          </div>
+        </div>
+      `;
+      result.classList.add("shown");
+    }
+
+    function renderScoreboard() {
+      const rows = presets.map(p => {
+        const d = scoreboardData[p.id];
+        if (!d) {
+          return `<tr>
+            <td>${p.name}</td>
+            <td colspan="5" style="color:var(--text-dim, #6b7280); font-style:italic;">not run</td>
+          </tr>`;
+        }
+        return `<tr>
+          <td>${p.name}</td>
+          <td>${d.ring_members_in_case} / ${d.ring_member_count}</td>
+          <td>${d.tier}</td>
+          <td>${d.case_score_100}</td>
+          <td>${Math.round(d.elapsed_ms)} ms</td>
+          <td class="${d.pass ? 'cell-pass' : 'cell-fail'}">${d.pass ? 'PASS' : 'FAIL'}</td>
+        </tr>`;
+      }).join("");
+      scoreboardBody.innerHTML = rows;
+    }
+
+    async function runOne(presetId) {
+      runBtn.disabled = true;
+      runAllBtn.disabled = true;
+      badge.className = "lab-badge pending";
+      badge.textContent = "Running…";
+      result.classList.add("shown");
+      checks.innerHTML = `<li>Injecting members of <strong>${presetId}</strong>…</li>`;
+      meta.innerHTML = "";
+
+      try {
+        const r = await fetch("/api/judge-lab/run", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ preset: presetId }),
+        });
+        const d = await r.json();
+        if (!d.ok) {
+          badge.className = "lab-badge fail";
+          badge.textContent = "Error";
+          checks.innerHTML = `<li><span class="no">×</span>§ ${d.error}</li>`;
+          return;
+        }
+        renderResult(d);
+        scoreboardData[presetId] = d;
+        renderScoreboard();
+      } finally {
+        runBtn.disabled = false;
+        runAllBtn.disabled = false;
+      }
+    }
+
+    runBtn.addEventListener("click", () => runOne(sel.value));
+
+    runAllBtn.addEventListener("click", async () => {
+      for (const k in scoreboardData) delete scoreboardData[k];
+      renderScoreboard();
+      for (const p of presets) {
+        await runOne(p.id);
+        await new Promise(r => setTimeout(r, 200));
+      }
+    });
+
+    clearBtn.addEventListener("click", () => {
+      for (const k in scoreboardData) delete scoreboardData[k];
+      renderScoreboard();
+      result.classList.remove("shown");
+    });
+
+    loadPresets();
+  })();
+  </script>
 </section>
 
 </main>
@@ -1049,7 +1548,7 @@
     try {
       const r = await api("/api/stress-test/inject", {
         method: "POST",
-        body: JSON.stringify({ seller_id: "SEL_003", ring_name: "SYNDICATE-APEX" })
+        body: JSON.stringify({ seller_id: "SELLER-0265", ring_name: "SYNDICATE-APEX" })
       });
       $("#mLatency").textContent = r.ms + " ms";
       toast("Ring injected · linked into " + (r.data.case_id || "1 case"));
@@ -1082,7 +1581,7 @@
 
   async function scoreSingle() {
     const payload = {
-      seller_id: $("#inSeller").value.trim() || "SEL_003",
+      seller_id: $("#inSeller").value.trim() || "SELLER-0265",
       account_id: "ACC-TEST-" + Math.random().toString(36).slice(2, 8).toUpperCase(),
       rating: 5,
       review_text: $("#inText").value.trim(),
@@ -1110,7 +1609,7 @@
   async function injectCustomRing() {
     const n = Math.max(3, Math.min(15, parseInt($("#inBots").value, 10) || 6));
     const payload = {
-      seller_id: $("#inSeller").value.trim() || "SEL_003",
+      seller_id: $("#inSeller").value.trim() || "SELLER-0265",
       ring_name: "CUSTOM",
       num_accounts: n,
       review_text: $("#inPhrase").value.trim(),
@@ -1270,7 +1769,7 @@ document.getElementById('assistantChips').addEventListener('click', e => {
 });
 assistantPush('sys', "I answer from the case store and a fixed knowledge base. "
   + "There is no generative model in this tab, so I will not invent a number.\n\n"
-  + "Try: *can I buy from SEL_003?* · *why was CASE-0000 flagged?* · "
+  + "Try: *can I buy from SELLER-0265?* · *why was CASE-0000 flagged?* · "
   + "*how fast is it?* · *what are the limitations?*");
 
 </script>
