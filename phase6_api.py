@@ -4012,6 +4012,93 @@ def _case_member_ids(case):
             out.append(rid)
     return out
 
+# ============================================================
+# Forensic timeline — v6.7
+# ============================================================
+_CASE_TS = {}            # dict[int, pd.Timestamp]
+_CASE_TS_BUILT = False
+
+def _coerce_ts(series):
+    """Parse timestamps that may be ISO strings or epoch numbers."""
+    s = pd.to_datetime(series, errors="coerce")
+    if s.notna().any():
+        yr = s.dropna().dt.year
+        if (yr < 2000).mean() > 0.9:
+            num = pd.to_numeric(series, errors="coerce")
+            if num.notna().any():
+                unit = "ms" if float(num.max()) > 1e11 else "s"
+                s2 = pd.to_datetime(num, unit=unit, errors="coerce")
+                if s2.notna().any():
+                    s = s2
+    return s
+
+
+def _build_timeline_index(force=False):
+    """review_id -> Timestamp, read once from scored_features.csv."""
+    global _CASE_TS, _CASE_TS_BUILT
+    if _CASE_TS_BUILT and not force:
+        return _CASE_TS
+    out = {}
+    path = "scored_features.csv"
+    try:
+        if _os.path.exists(path):
+            d = pd.read_csv(path, usecols=["review_id", "timestamp"])
+            ts = _coerce_ts(d["timestamp"])
+            for rid, t in zip(d["review_id"], ts):
+                if pd.isna(t):
+                    continue
+                try:
+                    out[int(rid)] = t
+                except (TypeError, ValueError):
+                    continue
+    except Exception as e:
+        print(f"[timeline] index build failed: {e}")
+    _CASE_TS = out
+    _CASE_TS_BUILT = True
+    print(f"[timeline] timestamps indexed: {len(out)}")
+    return out
+
+
+def _tl_get_case(case_id):
+    """Find a case in whichever dict the /api/case route uses."""
+    for name in ("CASES_BY_ID", "_CASES_BY_ID", "CASES", "cases_db", "_CASES"):
+        d = globals().get(name)
+        if isinstance(d, dict) and case_id in d:
+            return d[case_id]
+    return None
+
+
+@app.get("/api/case/{case_id}/timeline")
+def api_case_timeline(case_id: str):
+    case = _tl_get_case(case_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail=f"unknown case {case_id}")
+    idx = _build_timeline_index()
+    ids = _case_member_ids(case)
+    pts = [(rid, idx[rid]) for rid in ids if rid in idx]
+    pts.sort(key=lambda x: x[1])
+    if not pts:
+        return {"ok": True, "case_id": case_id, "n_timed": 0,
+                "n_members": len(ids), "span_minutes": 0.0,
+                "from": None, "to": None, "points": [],
+                "note": "no timestamps available for these reviews"}
+    t0, t1 = pts[0][1], pts[-1][1]
+    return {
+        "ok": True,
+        "case_id": case_id,
+        "n_timed": len(pts),
+        "n_members": len(ids),
+        "span_minutes": round((t1 - t0).total_seconds() / 60.0, 2),
+        "from": t0.isoformat(),
+        "to": t1.isoformat(),
+        "points": [
+            {"review_id": int(r),
+             "ts": t.isoformat(),
+             "offset_min": round((t - t0).total_seconds() / 60.0, 2)}
+            for r, t in pts
+        ],
+    }
+
 def _seller_trust_payload():
     now = _time_st.time()
     if (_SELLER_TRUST_CACHE["payload"] is not None

@@ -276,7 +276,8 @@
   /* ---------- forms ---------- */
   .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }
   @media (max-width: 940px) { .form-grid { grid-template-columns: 1fr; } }
-
+[data-theme="dark"] select { color-scheme: dark; }
+[data-theme="dark"] select option { background: #161616; color: #f2f2f2; }
   .field { margin-bottom: 14px; }
   .field-label { display: block; font-family: var(--mono); font-size: 9px; letter-spacing: .12em; text-transform: uppercase; color: var(--ink-3); margin-bottom: 6px; }
   .input {
@@ -405,6 +406,23 @@
 .mod-badge.dismiss   { background: rgba(239,68,68,0.18);  color: #ef4444; }
 .mod-badge.need_info { background: rgba(245,158,11,0.18); color: #f59e0b; }
 .mod-badge.none      { opacity: 0.6; }
+.tl-wrap { margin: 2px 0 16px; }
+.tl-track { position: relative; height: 38px; margin: 20px 6px 8px; }
+.tl-track::before { content:""; position:absolute; left:0; right:0; top:50%;
+  height:1px; background: var(--line, rgba(127,127,127,.28)); }
+
+.tl-track > i.tl-seg { position:absolute; top:50%; height:3px; margin-top:-1.5px;
+  border-radius:2px; background:#9aa0a6; opacity:.45; }
+.tl-track > i.tl-seg.hot { background:#c0392b; opacity:.9; }
+
+.tl-track > b { position:absolute; top:50%; width:10px; height:10px;
+  margin:-5px 0 0 -5px; border-radius:50%; background: var(--ink); z-index:2; }
+
+.tl-meta { display:flex; justify-content:space-between; gap:12px;
+  font-size:11px; letter-spacing:.06em; text-transform:uppercase; opacity:.6; }
+.tl-sub { margin-top:6px; font-size:12px; opacity:.78; line-height:1.45; }
+.tl-empty { font-size:12px; opacity:.6; padding:6px 0; }
+
 .mod-row { display: flex; gap: 6px; margin: 10px 0 6px; flex-wrap: wrap; }
 .mod-row button { font-size: 12px; padding: 5px 12px; cursor: pointer;
   background: var(--surface-2, rgba(127,127,127,0.08));
@@ -560,6 +578,11 @@
           <div class="section-label">Evidence</div>
           <ul class="evidence" id="dEvidence"></ul>
         </div>
+
+        <div class="block">
+  <h3>Forensic Timeline</h3>
+  <div id="dTimeline" class="tl-wrap"></div>
+</div>
 
         <div class="section">
           <div class="section-label">Connection Map</div>
@@ -1591,6 +1614,64 @@ function renderCaseDecision(caseId) {
   if (cb) cb.addEventListener("click", function () { clearDecision(caseId); });
 }
 
+async function renderTimeline(caseId){
+  const host = $("#dTimeline");
+  if (!host) return;
+  if (!caseId){ host.innerHTML = ""; return; }
+  host.innerHTML = '<div class="tl-empty">loading timeline…</div>';
+
+  let d;
+  try {
+    const r = await fetch(`/api/case/${encodeURIComponent(caseId)}/timeline`, {cache:"no-store"});
+    if (!r.ok) throw new Error(r.status);
+    d = await r.json();
+  } catch (e) {
+    host.innerHTML = '<div class="tl-empty">timeline unavailable</div>';
+    return;
+  }
+  if (!d || !d.ok || !d.n_timed){
+    host.innerHTML = `<div class="tl-empty">${(d && d.note) || 'no timestamps for these reviews'}</div>`;
+    return;
+  }
+
+  const hhmm = s => { const t = String(s || "").replace("T"," ").split(" "); return t[1] ? t[1].slice(0,5) : ""; };
+  const fmtGap = m => m < 1 ? `${Math.round(m * 60)} s` : `${m.toFixed(1)} min`;
+
+  const pts = d.points.slice().sort((a,b) => a.offset_min - b.offset_min);
+  const n = pts.length;
+
+  if (n === 1 || d.span_minutes < 0.05){
+    host.innerHTML = `<div class="tl-sub">${d.n_timed} review · all at ${hhmm(d.from)}</div>`;
+    return;
+  }
+
+  const span = d.span_minutes;
+  const x = off => 5 + (off / span) * 90;   // 5%–95%, so edge dots are never clipped
+
+  const gaps = [];
+  for (let i = 1; i < n; i++) gaps.push(pts[i].offset_min - pts[i-1].offset_min);
+  const med = gaps.slice().sort((a,b) => a - b)[Math.floor(gaps.length / 2)];
+  const hot = gaps.filter(g => g < 30).length;
+
+  const segs = gaps.map((g, i) => {
+    const a = x(pts[i].offset_min), b = x(pts[i+1].offset_min);
+    return `<i class="tl-seg${g < 30 ? " hot" : ""}" style="left:${a.toFixed(2)}%;width:${Math.max(0.4, b - a).toFixed(2)}%"></i>`;
+  }).join("");
+
+  const dots = pts.map(p =>
+    `<b style="left:${x(p.offset_min).toFixed(2)}%" title="review ${p.review_id} · +${p.offset_min.toFixed(1)} min"></b>`
+  ).join("");
+
+  host.innerHTML = `
+    <div class="tl-track">${segs}${dots}</div>
+    <div class="tl-meta">
+      <span>${hhmm(d.from)}</span>
+      <span>span ${span} min</span>
+      <span>${hhmm(d.to)}</span>
+    </div>
+    <div class="tl-sub">${d.n_timed} of ${d.n_members} reviews · median gap ${fmtGap(med)} · ${hot} of ${gaps.length} gaps under 30 min</div>`;
+}
+
 async function decideCase(caseId, action, note = "") {
   try {
     const r = await fetch(`/api/case/${encodeURIComponent(caseId)}/decision`, {
@@ -1735,6 +1816,7 @@ async function decideCase(caseId, action, note = "") {
             '<div class="review-text">' + esc(r.text) + "</div>" +
           "</div>").join("")
       : '<div class="review"><div class="review-text" style="color:var(--ink-3)">No previews available.</div></div>';
+        renderTimeline(c.case_id);
   }
 
   /* ---------- canvas graph ---------- */
