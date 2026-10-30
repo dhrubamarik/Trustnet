@@ -5,7 +5,7 @@ GET  /cases, GET /cases/{id}, GET /stats, POST /ingest
 
 Run:  py -3.14 phase6_api.py
 """
-
+import upload_io  
 import json
 import pickle
 import time
@@ -3546,7 +3546,846 @@ def api_debug_sellers():
 
 print("[console-api] v6.3 ready — seller aliases resolve")
 
+
+# ============================================================================
+# console-api v6.4 — Upload & Scan (sandboxed)
+# ----------------------------------------------------------------------------
+# Accepts a CSV upload (≤ 2000 rows, ≤ 5 MB), scores each row with the text
+# model + hyperbole signal, links rows using linker.py on a fresh instance,
+# reports rings + high-risk solos. Never mutates cases_db, REVIEW_INDEX or
+# MEMBER_TO_CASE — the upload is self-contained.
+# ============================================================================
+
+import io as _io
+from fastapi import UploadFile, File
+from fastapi.responses import Response
+from linker import IncrementalLinker as _UploadLinker
+from linker import _as_epoch as _parse_ts
+
+_UPLOAD_STATE = {
+    "scan_id": None, "cases": [], "rows": [],
+    "evidence": [], "evidence_line": "", "filename": None,
+}
+
+_UPLOAD_MAX_ROWS = 2000
+_UPLOAD_MAX_BYTES = 5 * 1024 * 1024
+_UPLOAD_TEXT_COLS = ("text_", "text", "review_text", "review", "body", "content")
+
+
+def _upload_validate(raw, filename):
+    if filename and not filename.lower().endswith((".csv", ".txt")):
+        return None, "Only .csv or .txt files are accepted."
+    if len(raw) > _UPLOAD_MAX_BYTES:
+        return None, ("File is %d KB; maximum is %d KB. "
+                      "Trim it to 2,000 rows or fewer." % (
+                          len(raw) // 1024, _UPLOAD_MAX_BYTES // 1024))
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            text = raw.decode("latin-1")
+        except Exception:
+            return None, "File is not valid UTF-8 or Latin-1."
+    try:
+        rows = list(_csv.DictReader(_io.StringIO(text)))
+    except Exception as e:
+        return None, "Could not parse CSV: %s" % e
+    if not rows:
+        return None, "File is empty or has no header row."
+    if len(rows) > _UPLOAD_MAX_ROWS:
+        return None, ("File has %d rows; maximum is %d. "
+                      "Trim it or split into multiple uploads." % (
+                          len(rows), _UPLOAD_MAX_ROWS))
+
+    cols = [c for c in (rows[0].keys() if rows else []) if c]
+    text_col = None
+    for c in cols:
+        if c.strip().lower() in _UPLOAD_TEXT_COLS:
+            text_col = c
+            break
+    if not text_col:
+        return None, ("No text column found. Expected one of: %s. "
+                      "Got: %s." % (", ".join(_UPLOAD_TEXT_COLS),
+                                    ", ".join(cols[:8]) or "none"))
+    return (rows, cols, text_col), None
+
+
+def _pick_col(row, *names):
+    for n in names:
+        v = row.get(n)
+        if v not in (None, ""):
+            return v
+    return None
+
+def _upload_fail(code, message, report=None, hints=None):
+    """Uniform failure payload. Always returns HTTP 200 with ok=False so the
+    dashboard never has to special-case a status code, and every list key is
+    present so the front-end never calls .map() on undefined."""
+    rep = report or {}
+    return {
+        "ok": False,
+        "error_code": code,
+        "error": message,
+        "hints": hints or rep.get("hints", []),
+        "report": rep or None,
+        "filename": (rep.get("file") or {}).get("name", ""),
+        "rows_total": (rep.get("file") or {}).get("rows_in_file", 0),
+        "rows_scanned": 0,
+        "rows_accepted": 0,
+        "rows_rejected": (rep.get("rows") or {}).get("rejected", 0),
+        "ring_cases": [],
+        "high_risk_solos": [],
+        "ring_cases_count": 0,
+        "high_risk_solo_count": 0,
+        "low_risk_solo_count": 0,
+        "flagged_count": 0,
+        "evidence": [],
+        "evidence_line": "",
+        "column_mapping": rep.get("column_mapping", {}),
+        "warnings": rep.get("warnings", []),
+        "guidance": rep.get("guidance", []),
+    }
+
+
+def _upload_regroup(lk, scored):
+    """Group uploaded rows by their FINAL union-find root.
+
+    lk.ingest() returns the root as it stood at that moment. A later row that
+    merges into the same component can re-parent an earlier row, leaving its
+    recorded root stale and stranding it alone. Resolving every id against the
+    linker's finished state makes the grouping independent of whichever union
+    rule the linker uses.
+    """
+    def _find(rid):
+        fn = getattr(lk, "find", None)
+        if callable(fn):
+            try:
+                return fn(rid)
+            except Exception:
+                pass
+        parent = getattr(lk, "parent", None)
+        if isinstance(parent, dict):
+            cur, seen = rid, set()
+            while parent.get(cur, cur) != cur and cur not in seen:
+                seen.add(cur)
+                cur = parent[cur]
+            return cur
+        return rid
+
+    groups = {}
+    for s in scored:
+        groups.setdefault(_find(s["review_id"]), []).append(s)
+
+    for root, members in groups.items():
+        for s in members:
+            s["cluster_root"] = root
+            s["cluster_size"] = len(members)
+    return groups
+
+
+def _upload_opt(v):
+    """NaN / NaT / None -> None, everything else floats cleanly."""
+    try:
+        if v is None:
+            return None
+        if v != v:            # NaN
+            return None
+    except (TypeError, ValueError):
+        return v
+    return v
+
+@app.post("/api/upload/scan")
+async def api_upload_scan(file: UploadFile = File(...)):
+    import pandas as _pd
+
+    filename = file.filename or "upload.csv"
+    try:
+        raw = await file.read()
+    except Exception as e:
+        return _upload_fail("read_failed", "Could not read file: %s" % e)
+
+    prep = upload_io.prepare(raw, filename)
+    report = prep["report"]
+    if not prep["ok"]:
+        return _upload_fail(
+            report.get("error_code"),
+            report.get("message") or "The file could not be scanned.",
+            report)
+
+    df = prep["df"]                      # 9 canonical columns, clean, indexed
+
+    lk = _UploadLinker()                 # fresh, empty — self-contained sandbox
+    base_rid = 1_000_000
+    scored = []
+
+    for seq, (idx, row) in enumerate(df.iterrows()):
+        text = str(row.get("text_") or "").strip()
+        if not text:
+            continue
+
+        seller = str(row.get("seller_id") or "").strip()
+        if seller:
+            canonical, _note = _resolve_seller(seller, allow_fallback=False)
+            if canonical:
+                seller = canonical
+
+        age = _upload_opt(row.get("account_age_hours"))
+        age = float(age) if isinstance(age, (int, float)) else None
+
+        rating = _upload_opt(row.get("rating"))
+        rating = float(rating) if isinstance(rating, (int, float)) else 0.0
+
+        ts = row.get("timestamp")
+        try:
+            ts = None if (ts is None or _pd.isna(ts)) else ts
+        except (TypeError, ValueError):
+            ts = None
+
+        rid = base_rid + seq
+        payload = {
+            "review_id": rid,
+            "text_": text,
+            "seller_id": seller or None,
+            "device_fingerprint": str(row.get("device_fingerprint") or ""),
+            "ip_block": str(row.get("ip_block") or ""),
+            "payment_instrument": str(row.get("payment_instrument") or ""),
+            "account_age_hours": age,
+            "timestamp": ts,
+            "rating": rating,
+        }
+
+        try:
+            res = lk.ingest(payload)
+        except Exception as e:
+            return _upload_fail(
+                "ingest_failed",
+                "Linker failed on row %d: %s" % (int(idx) + 2, e))
+
+        risk = _live_risk(payload)
+        scored.append({
+            "row": int(idx) + 2,
+            "review_id": rid,
+            "text": text[:200],
+            "rating": rating,
+            "seller_id": seller,
+            "account_id": (str(row.get("account_id") or "").strip()
+                           or ("ACCT-UPLOAD-%03d" % seq)),
+            "risk": round(float(risk), 4),
+            "risk_100": _score_100_review(risk),
+            "cluster_root": None,
+            "cluster_size": 1,
+            "signals": list(res.get("signals", []) or []),
+        })
+
+    if not scored:
+        return _upload_fail(
+            "no_scored_rows",
+            "No rows had usable review text after cleaning.",
+            report)
+
+    by_root = _upload_regroup(lk, scored)      # <-- the actual fix
+
+    cases, all_evidence = [], set()
+
+    for root, members in by_root.items():
+        if len(members) < 2:
+            m = members[0]
+            cases.append({
+                "case_id": "UPLOAD-SOLO-%d" % m["review_id"],
+                "type": "solo",
+                "tier": "Watch",
+                "n_members": 1,
+                "members": [m["review_id"]],
+                "signals": [],
+                "row_numbers": [m["row"]],
+                "seller_ids": [m["seller_id"]] if m["seller_id"] else [],
+                "case_score_100": m["risk_100"],
+                "max_risk": m["risk"],
+            })
+            continue
+
+        evidence = set()
+        for m in members:
+            evidence |= set(m.get("signals", []))
+        all_evidence |= evidence
+
+        diversity = len(evidence)
+        max_risk = max(m["risk"] for m in members)
+        raw_score = max_risk + size_bonus(len(members)) + diversity_bonus(diversity)
+        tier = _tier_for_case(raw_score, diversity, len(members))
+
+        cases.append({
+            "case_id": "UPLOAD-RING-%d" % root,
+            "type": "ring",
+            "tier": tier,
+            "n_members": len(members),
+            "members": [m["review_id"] for m in members],
+            "signals": sorted(evidence),
+            "row_numbers": sorted(m["row"] for m in members),
+            "seller_ids": sorted({m["seller_id"] for m in members
+                                  if m["seller_id"]}),
+            "case_score_100": _score_100(raw_score),
+            "max_risk": max_risk,
+        })
+
+    cases.sort(key=lambda c: -c["case_score_100"])
+    rings = [c for c in cases if c["type"] == "ring"]
+    high_solos = [c for c in cases
+                  if c["type"] == "solo" and c["case_score_100"] >= 50]
+    low_solo_count = len(cases) - len(rings) - len(high_solos)
+
+    if all_evidence:
+        evidence_line = "Linked by: " + ", ".join(
+            SIGNAL_LABEL.get(s, s.replace("_", " ")) for s in sorted(all_evidence))
+    else:
+        evidence_line = "No shared evidence between any two rows."
+
+    scan_id = _uuid.uuid4().hex[:12].upper()
+    _UPLOAD_STATE.update({
+        "scan_id": scan_id,
+        "cases": cases,
+        "rows": scored,
+        "evidence": sorted(all_evidence),
+        "evidence_line": evidence_line,
+        "filename": filename,
+    })
+
+    return {
+        "ok": True,
+        "scan_id": scan_id,
+        "filename": filename,
+
+        # counts
+        "rows_total": report["file"]["rows_in_file"],
+        "rows_scanned": len(scored),                 # kept name: test depends on it
+        "rows_accepted": report["rows"]["accepted"],
+        "rows_rejected": report["rows"]["rejected"],
+        "flagged_count": len(high_solos) + sum(c["n_members"] for c in rings),
+
+        # results
+        "ring_cases": rings,
+        "high_risk_solos": high_solos[:10],
+        "low_risk_solo_count": low_solo_count,
+        "ring_cases_count": len(rings),
+        "high_risk_solo_count": len(high_solos),
+        "evidence": sorted(all_evidence),
+        "evidence_line": evidence_line,
+
+        # what upload_io understood about the file
+        "column_mapping": report["column_mapping"],
+        "unused_columns": report["unused_columns"],
+        "confidence": report["confidence"],
+        "warnings": report["warnings"],
+        "guidance": report["guidance"],
+        "profile": report["profile"],
+        "rejected": report["rejected"],
+    }
+
+
+@app.get("/api/upload/results.csv")
+def api_upload_results_csv():
+    if not _UPLOAD_STATE.get("scan_id"):
+        return Response("No scan available. Upload a file first.",
+                        media_type="text/plain", status_code=400)
+
+    buf = _io.StringIO()
+    w = _csv.writer(buf)
+    w.writerow(["row", "review_id", "risk_0_100", "cluster_root",
+                "cluster_size", "signals", "seller_id", "account_id",
+                "rating", "text"])
+    for s in _UPLOAD_STATE["rows"]:
+        w.writerow([s["row"], s["review_id"], s["risk_100"],
+                    s["cluster_root"], s["cluster_size"],
+                    "|".join(s["signals"]), s["seller_id"],
+                    s["account_id"], s["rating"], s["text"]])
+
+    headers = {
+        "Content-Disposition":
+            'attachment; filename="trustnet_scan_%s.csv"' % _UPLOAD_STATE["scan_id"]
+    }
+    return Response(content=buf.getvalue(), media_type="text/csv",
+                    headers=headers)
+
+
+@app.post("/api/upload/clear")
+def api_upload_clear():
+    _UPLOAD_STATE.update({
+        "scan_id": None, "cases": [], "rows": [],
+        "evidence": [], "evidence_line": "", "filename": None,
+    })
+    return {"ok": True}
+
+
+@app.get("/api/upload/state")
+def api_upload_state():
+    return {
+        "scan_id": _UPLOAD_STATE["scan_id"],
+        "filename": _UPLOAD_STATE["filename"],
+        "rows": len(_UPLOAD_STATE["rows"]),
+        "cases": len(_UPLOAD_STATE["cases"]),
+    }
+
+
+print("[console-api] v6.4 ready — upload & scan")
+
+# ==== v6.5 SELLER TRUST SCORES (A4) ====
+import os as _os_st
+import json as _json_st
+import time as _time_st
+
+SELLER_TRUST_WEIGHTS = {
+    "ring_depth":     0.35,   # reviews inside a coordinated ring
+    "escalate_depth": 0.25,   # reviews inside an escalated case
+    "review_case":    0.12,   # reviews inside linked (Review-tier) cases
+    "mean_risk":      0.16,   # mean per-review risk
+    "infrastructure": 0.08,   # device / IP / payment crowding
+    "fresh_accounts": 0.04,   # share of accounts younger than 24 h
+}
+_SELLER_RING_SATURATE = 3     # 3 ring reviews = full ring penalty
+_SELLER_ESC_SATURATE  = 2     # 2 escalated reviews = full escalate penalty
+_SELLER_CASE_SATURATE = 2     # 2 linked-case reviews = full case penalty
+_SELLER_RING_FLOOR    = 0.45  # any ring review caps trust at 55
+_SELLER_ESC_FLOOR     = 0.30  # any escalated review caps trust at 70
+_SELLER_TRUST_TTL = 3.0
+_SELLER_TRUST_CACHE = {"built": 0.0, "payload": None}
+
+MOD_CONFIRM_MAX = 25
+MOD_DISMISS_MAX = 10
+
+
+def _seller_band(score):
+    if score >= 90: return "trusted"
+    if score >= 75: return "cautious"
+    if score >= 60: return "watch"
+    if score >= 40: return "suspect"
+    return "high_risk"
+
+
+def _band_counts(rows):
+    out = {"trusted": 0, "cautious": 0, "watch": 0, "suspect": 0, "high_risk": 0}
+    for r in rows:
+        out[r["band"]] = out.get(r["band"], 0) + 1
+    return out
+
+def _case_member_ids(case):
+    """Review IDs from a cases_db record, whatever the field is called.
+
+    Accepts a list of ints, a list of dicts, a JSON-ish string, or a
+    comma-separated string. Returns a de-duplicated list of ints.
+    """
+    if not isinstance(case, dict):
+        return []
+
+    raw = None
+    for k in ("member_ids", "members", "_members", "review_ids",
+              "review_id_list", "review_list", "reviews", "member_id_list"):
+        v = case.get(k)
+        if v:
+            raw = v
+            break
+    if raw is None:
+        return []
+
+    if isinstance(raw, str):
+        s = raw.strip().strip("[](){}").strip("'\"")
+        if not s:
+            return []
+        for sep in (";", "|", " ", "\t"):
+            s = s.replace(sep, ",")
+        items = [p.strip().strip("'\"") for p in s.split(",")]
+        items = [p for p in items if p]
+    elif isinstance(raw, (list, tuple, set)):
+        items = list(raw)
+    else:
+        items = [raw]
+
+    out, seen = [], set()
+    for it in items:
+        if isinstance(it, dict):
+            it = it.get("review_id") or it.get("id") or it.get("rid")
+        try:
+            rid = int(float(it))
+        except (TypeError, ValueError):
+            continue
+        if rid not in seen:
+            seen.add(rid)
+            out.append(rid)
+    return out
+
+def _seller_trust_payload():
+    now = _time_st.time()
+    if (_SELLER_TRUST_CACHE["payload"] is not None
+            and now - _SELLER_TRUST_CACHE["built"] < _SELLER_TRUST_TTL):
+        return _SELLER_TRUST_CACHE["payload"]
+
+    path = _os_st.path.join(_os_st.path.dirname(_os_st.path.abspath(__file__)),
+                            "scored_features.csv")
+    if not _os_st.path.exists(path):
+        return {"error": "scored_features.csv missing", "n_sellers": 0,
+                "sellers": [], "top10_riskiest": [], "top10_trusted": []}
+
+    import pandas as _pd
+    df = _pd.read_csv(path)
+    need = {"review_id", "seller_id"}
+    if not need.issubset(df.columns):
+        return {"error": "scored_features.csv missing %s"
+                         % sorted(need - set(df.columns)),
+                "n_sellers": 0, "sellers": [],
+                "top10_riskiest": [], "top10_trusted": []}
+
+    if "risk_score" not in df.columns:
+        df["risk_score"] = 0.0
+    df["risk_score"] = _pd.to_numeric(df["risk_score"], errors="coerce").fillna(0.0)
+    df["review_id"] = _pd.to_numeric(df["review_id"], errors="coerce")
+
+    ring_size, esc_ids, link_ids = {}, set(), set()
+    scan_diag = {
+        "cases_total": len(cases_db or {}),
+        "cases_with_members": 0,
+        "members_seen": 0,
+        "ring_member_ids": 0,
+        "escalate_member_ids": 0,
+        "tier_values": {},
+        "cases_without_members": [],
+    }
+
+    for cid, c in (cases_db or {}).items():
+        ids = _case_member_ids(c)
+        if not ids:
+            if len(scan_diag["cases_without_members"]) < 3:
+                scan_diag["cases_without_members"].append({
+                    "case_id": str(cid),
+                    "keys": sorted(c.keys())[:20] if isinstance(c, dict) else
+                            type(c).__name__,
+                })
+            continue
+
+        scan_diag["cases_with_members"] += 1
+        scan_diag["members_seen"] += len(ids)
+
+        tier = str(c.get("tier") or c.get("severity_tier") or "").upper()
+        scan_diag["tier_values"][tier] = \
+            scan_diag["tier_values"].get(tier, 0) + 1
+
+        if len(ids) >= 3:
+            for rid in ids:
+                ring_size[rid] = len(ids)
+        if tier == "ESCALATE":
+            esc_ids.update(ids)
+        if tier in ("REVIEW", "ESCALATE"):
+            link_ids.update(ids)
+
+    scan_diag["ring_member_ids"] = len(ring_size)
+    scan_diag["escalate_member_ids"] = len(esc_ids)
+
+    df["_ring_size"] = df["review_id"].map(ring_size).fillna(0).astype(float)
+    df["_in_ring"]   = (df["_ring_size"] > 0).astype(float)
+    df["_in_esc"]    = df["review_id"].isin(esc_ids).astype(float)
+    df["_in_link"]   = df["review_id"].isin(link_ids).astype(float)
+
+    agg = df.groupby("seller_id").agg(
+        n_reviews=("review_id", "count"),
+        n_ring=("_in_ring", "sum"),
+        n_esc=("_in_esc", "sum"),
+        n_link=("_in_link", "sum"),
+        mean_risk=("risk_score", "mean"),
+    )
+
+    crowd_cols = [c for c in ("shared_device", "shared_ip", "shared_payment")
+                  if c in df.columns]
+    if crowd_cols:
+        parts = []
+        for c in crowd_cols:
+            v = _pd.to_numeric(df[c], errors="coerce").fillna(1.0)
+            df["_crowd_" + c] = ((v - 1.0) / 6.0).clip(0.0, 1.0)
+            parts.append("_crowd_" + c)
+        agg["infra"] = df.groupby("seller_id")[parts].mean().mean(axis=1)
+    else:
+        agg["infra"] = 0.0
+
+    if "account_age_hours" in df.columns:
+        age = _pd.to_numeric(df["account_age_hours"], errors="coerce")
+        df["_fresh"] = ((age >= 0) & (age < 24)).astype(float)
+        agg["fresh"] = df.groupby("seller_id")["_fresh"].mean()
+    else:
+        agg["fresh"] = 0.0
+
+    comp = {
+        "ring_depth":     (agg["n_ring"] / _SELLER_RING_SATURATE).clip(0.0, 1.0),
+        "escalate_depth": (agg["n_esc"] / _SELLER_ESC_SATURATE).clip(0.0, 1.0),
+        "review_case":    (agg["n_link"] / _SELLER_CASE_SATURATE).clip(0.0, 1.0),
+        "mean_risk":      agg["mean_risk"].clip(0.0, 1.0),
+        "infrastructure": agg["infra"].clip(0.0, 1.0),
+        "fresh_accounts": agg["fresh"].clip(0.0, 1.0),
+    }
+    penalty = sum(SELLER_TRUST_WEIGHTS[n] * comp[n] for n in SELLER_TRUST_WEIGHTS)
+    penalty = penalty.clip(0.0, 1.0)
+
+    ring_hit = agg["n_ring"] > 0
+    esc_hit  = agg["n_esc"]  > 0
+    penalty  = penalty.where(~ring_hit, penalty.clip(lower=_SELLER_RING_FLOOR))
+    penalty  = penalty.where(~esc_hit,  penalty.clip(lower=_SELLER_ESC_FLOOR))
+    penalty  = penalty.clip(0.0, 1.0)
+    trust    = (100.0 * (1.0 - penalty)).round(0).astype(int)
+
+    mod_adjust, mod_reason = {}, {}
+    try:
+        _decisions = _mod_load()
+    except Exception:
+        _decisions = {}
+
+    if _decisions:
+        rev_seller = {}
+        for rid, sel in zip(df["review_id"], df["seller_id"]):
+            try:
+                rev_seller[int(rid)] = str(sel)
+            except (TypeError, ValueError):
+                continue
+
+        n_conf, n_dis = {}, {}
+        for cid, rec in _decisions.items():
+            act = (rec or {}).get("action")
+            if act not in ("confirm", "dismiss"):
+                continue
+            case = (cases_db or {}).get(cid)
+            if not case:
+                continue
+            for rid in _case_member_ids(case):
+                sel = rev_seller.get(rid)
+                if not sel:
+                    continue
+                bucket = n_conf if act == "confirm" else n_dis
+                bucket[sel] = bucket.get(sel, 0) + 1
+
+        for raw in list(trust.index):
+            key = str(raw)
+            nc, nd = n_conf.get(key, 0), n_dis.get(key, 0)
+            if not nc and not nd:
+                continue
+            pts = 0
+            if nc:
+                pts -= min(MOD_CONFIRM_MAX, int(round(6.0 * (nc ** 0.5))))
+            if nd:
+                pts += min(MOD_DISMISS_MAX, int(round(4.0 * (nd ** 0.5))))
+            if not pts:
+                continue
+            before = int(trust.loc[raw])
+            trust.loc[raw] = max(0, min(100, before + pts))
+            mod_adjust[key] = int(trust.loc[raw]) - before
+            bits = []
+            if nc:
+                bits.append("confirmed %d review%s"
+                            % (nc, "" if nc == 1 else "s"))
+            if nd:
+                bits.append("dismissed %d review%s"
+                            % (nd, "" if nd == 1 else "s"))
+            mod_reason[key] = "moderator " + " and ".join(bits)
+
+    rows = []
+    for seller in agg.index:
+        key = str(seller)
+        t = int(trust.loc[seller])
+        n_r = int(agg["n_ring"].loc[seller])
+        n_e = int(agg["n_esc"].loc[seller])
+        n_l = int(agg["n_link"].loc[seller])
+        mean_r = float(agg["mean_risk"].loc[seller])
+        infra = float(agg["infra"].loc[seller])
+        fresh = float(agg["fresh"].loc[seller])
+
+        reasons = []
+        if n_r:
+            sizes = df.loc[(df["seller_id"] == seller) & (df["_ring_size"] > 0),
+                           "_ring_size"]
+            size_note = " of %d accounts" % int(sizes.max()) if len(sizes) else ""
+            reasons.append("%d review%s inside a coordinated ring%s"
+                           % (n_r, "" if n_r == 1 else "s", size_note))
+        if n_e:
+            reasons.append("%d escalated review%s"
+                           % (n_e, "" if n_e == 1 else "s"))
+        if n_l and not n_e:
+            reasons.append("%d review%s inside linked cases"
+                           % (n_l, "" if n_l == 1 else "s"))
+        if mean_r >= 0.30:
+            reasons.append("mean per-review risk %.2f" % mean_r)
+        if infra >= 0.35:
+            reasons.append("accounts repeatedly share device, IP or card")
+        if fresh >= 0.30:
+            reasons.append("%.0f%% of accounts under 24 h old" % (100 * fresh))
+
+        adj = mod_adjust.get(key, 0)
+        if adj:
+            if reasons == ["no coordination evidence above threshold"]:
+                reasons = []
+            reasons.insert(0, "%s (%+d trust)"
+                           % (mod_reason.get(key, "moderator decision"), adj))
+
+        if not reasons:
+            reasons.append("no coordination evidence above threshold")
+
+        rows.append({
+            "seller_id": key,
+            "trust_score": t,
+            "band": _seller_band(t),
+            "n_reviews": int(agg["n_reviews"].loc[seller]),
+            "components": {n: round(float(comp[n].loc[seller]), 3)
+                           for n in SELLER_TRUST_WEIGHTS},
+            "counts": {"ring": n_r, "escalated": n_e, "linked": n_l},
+            "reasons": reasons,
+            "moderation_adjustment": adj,
+        })
+
+    rows.sort(key=lambda r: (r["trust_score"], -r["n_reviews"]))
+    payload = {
+        "n_sellers": len(rows),
+        "weights": SELLER_TRUST_WEIGHTS,
+        "saturate": {"ring": _SELLER_RING_SATURATE,
+                     "escalate": _SELLER_ESC_SATURATE,
+                     "case": _SELLER_CASE_SATURATE},
+        "floors": {"ring": _SELLER_RING_FLOOR, "escalate": _SELLER_ESC_FLOOR},
+        "band_counts": _band_counts(rows),
+        "diagnostics": scan_diag,
+        "sellers": rows,
+        "top10_riskiest": rows[:10],
+        "top10_trusted": sorted(
+            (r for r in rows if r["n_reviews"] >= 5),
+            key=lambda r: (-r["trust_score"], -r["n_reviews"]))[:10],
+    }
+    _SELLER_TRUST_CACHE.update(built=now, payload=payload)
+    return payload
+
+
+@app.get("/api/sellers/trust")
+def api_sellers_trust(limit: int = 10, full: int = 0):
+    p = _seller_trust_payload()
+    limit = max(1, min(50, int(limit or 10)))
+    out = dict(p)
+    
+    out["top10_riskiest"] = p.get("top10_riskiest", [])[:limit]
+    out["top10_trusted"] = p.get("top10_trusted", [])[:limit]
+    if not full:
+        out["sellers"] = out["top10_riskiest"]
+        out["sellers_truncated"] = True
+    else:
+        out["sellers_truncated"] = False
+    return out
+
+# ==== v6.6 MODERATOR DECISIONS (A6) ====
+import datetime as _dt_m
+from fastapi import Request as _Req
+from fastapi.responses import JSONResponse as _JSONRes
+
+_MOD_ACTIONS = {"confirm", "dismiss", "need_info"}
+_MOD_PATH = _os_st.path.join(_os_st.path.dirname(_os_st.path.abspath(__file__)),
+                             "mod_decisions.json")
+_MOD_CACHE = {"mtime": None, "data": {}}
+
+
+def _mod_load():
+    try:
+        m = _os_st.path.getmtime(_MOD_PATH)
+    except OSError:
+        return {}
+    if _MOD_CACHE["mtime"] == m:
+        return _MOD_CACHE["data"]
+    try:
+        with open(_MOD_PATH, "r", encoding="utf-8") as f:
+            data = _json_st.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        data = {}
+    _MOD_CACHE.update(mtime=m, data=data)
+    return data
+
+
+def _mod_save(data):
+    tmp = _MOD_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        _json_st.dump(data, f, indent=2, sort_keys=True, default=str)
+    _os_st.replace(tmp, _MOD_PATH)
+    _MOD_CACHE.update(mtime=_os_st.path.getmtime(_MOD_PATH), data=data)
+
+
+def _mod_counts(data):
+    counts = {"confirm": 0, "dismiss": 0, "need_info": 0}
+    for v in data.values():
+        a = (v or {}).get("action")
+        if a in counts:
+            counts[a] += 1
+    return counts
+
+
+@app.get("/api/decisions")
+def api_decisions():
+    d = _mod_load()
+    return {"n_decided": len(d), "counts": _mod_counts(d), "decisions": d}
+
+@app.post("/api/decisions/clear")
+def api_decisions_clear():
+    _mod_save({})
+    _SELLER_TRUST_CACHE["built"] = 0.0
+    return {"ok": True, "n_decided": 0,
+            "counts": {"confirm": 0, "dismiss": 0, "need_info": 0}}
+
+@app.get("/api/case/{case_id}/decision")
+def api_case_decision(case_id: str):
+    if case_id not in cases_db:
+        return _JSONRes({"ok": False, "error": f"unknown case '{case_id}'"},
+                        status_code=404)
+    return {"ok": True, "case_id": case_id,
+            "decision": _mod_load().get(case_id)}
+
+
+@app.post("/api/case/{case_id}/decision")
+async def api_case_decide(case_id: str, request: _Req):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+
+    action = str(body.get("action", "")).strip().lower().replace("-", "_")
+    if action not in _MOD_ACTIONS:
+        return _JSONRes({"ok": False, "error": "unknown action",
+                         "allowed": sorted(_MOD_ACTIONS)}, status_code=400)
+    if case_id not in cases_db:
+        return _JSONRes({"ok": False, "error": f"unknown case '{case_id}'"},
+                        status_code=404)
+
+    data = _mod_load()
+    hist = list((data.get(case_id) or {}).get("history") or [])
+    entry = {
+        "action": action,
+        "note": str(body.get("note", ""))[:2000],
+        "moderator": str(body.get("moderator", "moderator-1"))[:120],
+        "ts": _dt_m.datetime.now(_dt_m.timezone.utc).isoformat(timespec="seconds"),
+    }
+    hist.append(entry)
+    data[case_id] = {"case_id": case_id, **entry, "history": hist[-50:]}
+    _mod_save(data)
+    _SELLER_TRUST_CACHE["built"] = 0.0        # seller scores must recompute now
+    return {"ok": True, "case_id": case_id, "decision": data[case_id],
+            "counts": _mod_counts(data)}
+
+@app.post("/api/case/{case_id}/decision/clear")
+def api_case_decision_clear(case_id: str):
+    data = _mod_load()
+    prev = data.get(case_id)
+    if not prev:
+        return {"ok": True, "case_id": case_id, "cleared": False,
+                "counts": _mod_counts(data)}
+    data.pop(case_id, None)
+    _mod_save(data)
+    try:
+        _SELLER_TRUST_CACHE["built"] = 0.0
+    except NameError:
+        pass
+    return {"ok": True, "case_id": case_id, "cleared": True,
+            "previous_action": prev.get("action"),
+            "counts": _mod_counts(data)}
+
 if __name__ == "__main__":
     import uvicorn
-    print("\n🚀 TrustNet API on http://127.0.0.1:8000")
+    print("\n🚀 TrustNet API on http://127.0.0.1:8000/landing")
     uvicorn.run(app, host="0.0.0.0", port=8000)

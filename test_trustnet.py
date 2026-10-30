@@ -233,3 +233,62 @@ def test_seller_alias_resolves():
     }).json()
     assert body["ok"] is True, body
     assert body["seller_id"].startswith("SELLER-"), body
+
+
+def _mk_csv(header, rows):
+    import io
+    buf = io.StringIO()
+    buf.write(",".join(header) + "\n")
+    for r in rows:
+        buf.write(",".join('"' + str(c).replace('"', '""') + '"' for c in r) + "\n")
+    return buf.getvalue()
+
+
+def test_upload_good_file():
+    """8-row ring + 2 solos → one ring case, no pollution of main state."""
+    header = ["text_", "seller_id", "device_fingerprint", "ip_block",
+              "payment_instrument", "account_age_hours"]
+    rows = [["UNBELIEVABLE 10/10 MUST BUY!!! ring row %d" % i,
+             "SELLER-0001", "DEV-UP-RING-1", "198.51.100.0/24",
+             "PAY-UP-RING-1", "2.0"] for i in range(8)]
+    rows.append(["Product works fine. Order 1234.", "SELLER-0002", "", "", "", "800"])
+    rows.append(["Broke after two days. Disappointed.", "SELLER-0003", "", "", "", "400"])
+
+    r = client.post("/api/upload/scan", files={
+        "file": ("test.csv", _mk_csv(header, rows), "text/csv")})
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["ok"] is True, d
+    assert d["rows_scanned"] == 10
+    assert d["ring_cases_count"] >= 1, d
+    ring = d["ring_cases"][0]
+    assert ring["n_members"] >= 8
+
+
+def test_upload_missing_text_column():
+    r = client.post("/api/upload/scan", files={
+        "file": ("test.csv", "rating,seller_id\n5,SELLER-0001\n4,SELLER-0002\n",
+                 "text/csv")})
+    d = r.json()
+    assert d["ok"] is False
+    assert "text column" in d["error"].lower(), d["error"]
+
+
+def test_upload_too_many_rows():
+    header = ["text_"]
+    rows = [["Review %d" % i] for i in range(2100)]
+    r = client.post("/api/upload/scan", files={
+        "file": ("test.csv", _mk_csv(header, rows), "text/csv")})
+    d = r.json()
+    assert d["ok"] is False
+    assert "2000" in d["error"], d["error"]
+
+
+def test_upload_does_not_change_main_cases():
+    before = client.get("/api/cases").json()["total"]
+    r = client.post("/api/upload/scan", files={
+        "file": ("test.csv", "text_\nUnrelated upload review a\nUnrelated upload review b\n",
+                 "text/csv")})
+    assert r.json()["ok"] is True
+    after = client.get("/api/cases").json()["total"]
+    assert after == before, f"upload polluted main state: {before} -> {after}"

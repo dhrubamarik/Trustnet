@@ -318,7 +318,6 @@
   .bench > div:first-child { border-left: 0; }
   .bench .metric-label { margin-bottom: 4px; }
     /* ---------- assistant ---------- */
-    /* ---------- assistant ---------- */
   [data-view-panel="assistant"] { display: flex; }
   .assistant-wrap {
     display: flex; flex-direction: column; gap: 14px;
@@ -398,7 +397,40 @@
     transition: opacity .16s var(--ease), transform .16s var(--ease);
   }
   .toast[data-show="1"] { opacity: 1; transform: translate(-50%, 0); }
+
+  /* --- moderator decisions --- */
+.mod-badge { font-size: 11px; padding: 2px 8px; border-radius: 999px;
+  border: 1px solid rgba(127,127,127,0.30); color: inherit; white-space: nowrap; }
+.mod-badge.confirm   { background: rgba(34,197,94,0.18);  color: #22c55e; }
+.mod-badge.dismiss   { background: rgba(239,68,68,0.18);  color: #ef4444; }
+.mod-badge.need_info { background: rgba(245,158,11,0.18); color: #f59e0b; }
+.mod-badge.none      { opacity: 0.6; }
+.mod-row { display: flex; gap: 6px; margin: 10px 0 6px; flex-wrap: wrap; }
+.mod-row button { font-size: 12px; padding: 5px 12px; cursor: pointer;
+  background: var(--surface-2, rgba(127,127,127,0.08));
+  border: 1px solid rgba(127,127,127,0.28);
+  color: inherit; border-radius: 6px; }
+.mod-row button:hover { border-color: rgba(127,127,127,0.55); }
+.mod-meta { display: flex; gap: 10px; align-items: center; font-size: 11px;
+  opacity: 0.85; }
+
+  /* --- seller ledger --- */
+.trust-cell { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
+.trust-bar { width: 54px; height: 4px; background: var(--line-2); position: relative; overflow: hidden; }
+.trust-bar > i { position: absolute; top: 0; bottom: 0; left: 0; display: block; }
+.band { font-family: var(--mono); font-size: 9px; letter-spacing: .1em;
+  text-transform: uppercase; white-space: nowrap; }
+.band-high_risk { color: var(--crit); }
+.band-suspect   { color: var(--warn); }
+.band-watch     { color: var(--ink-2); }
+.band-trusted   { color: var(--ok); }
+.band-cautious { color: var(--info); }
+
+.mod-row button.mod-clear { color: var(--ink-3); border-style: dashed; }
+.mod-row button.mod-clear:hover { color: var(--crit); border-color: var(--crit); }
+
 </style>
+
 </head>
 <body>
 
@@ -456,6 +488,7 @@
   <button class="tab" role="tab" data-view="arch"  aria-selected="false"><span class="idx">04</span>Architecture</button>
   <button class="tab" role="tab" data-view="assistant" aria-selected="false"><span class="idx">05</span>Assistant</button>
   <button class="tab" role="tab" data-view="lab" aria-selected="false" ><span class="idx">06</span>Judge Lab</button>
+  <button class="tab" role="tab" data-view="sellers" aria-selected="false"><span class="idx">07</span>Sellers</button>
 </nav>
 
 <main>
@@ -508,9 +541,14 @@
           <div class="detail-score" id="dScore">—<small id="dTier">—</small></div>
         </div>
 
-        <div class="section">
+                <div class="section">
           <div class="section-label">Action Required</div>
           <div class="action" id="dAction">—</div>
+        </div>
+
+        <div class="section">
+          <div class="section-label">Moderator Decision</div>
+          <div id="caseDecision"></div>
         </div>
 
         <div class="section">
@@ -687,7 +725,7 @@
 </section>
 
 <!-- ============ 06 Judge lab ============ -->
- <section data-view-panel="lab">
+ <section data-view-panel="lab" hidden>
  <style>
   /* Dark- and light-safe. Surfaces use --surface-2 (present in both themes);
      fallback is a neutral translucent tint. Text inherits from the active
@@ -1029,6 +1067,126 @@
         and we say that too.
       </div>
     </div>
+  
+    <div class="lab-card">
+  <h3>Bring your own data</h3>
+  <p class="lab-hint" style="margin-top:0;">
+    Upload a CSV with a <code>text_</code>, <code>text</code> or <code>review_text</code> column.
+    Maximum 2,000 rows, 5 MB. Optional columns: <code>rating</code>, <code>seller_id</code>,
+    <code>account_id</code>, <code>account_age_hours</code>,
+    <code>device_fingerprint</code>, <code>ip_block</code>,
+    <code>payment_instrument</code>, <code>timestamp</code>.
+    Missing infrastructure is treated as no link — no invented defaults.
+  </p>
+  <div class="lab-controls">
+    <input type="file" id="upload-file" accept=".csv,.txt"
+           style="flex:1 1 320px; padding:8px; border-radius:8px; border:1px solid rgba(127,127,127,0.28); background:rgba(127,127,127,0.08); color:inherit; font-family:inherit; font-size:13px;">
+    <button class="lab-btn-primary" id="upload-scan-btn">Scan</button>
+    <button class="lab-btn-secondary" id="upload-clear-btn">Clear</button>
+  </div>
+  <div class="lab-desc" id="upload-desc"></div>
+  <div id="upload-result" style="display:none; margin-top:16px;"></div>
+</div>
+
+<script>
+(function () {
+  const fileEl = document.getElementById("upload-file");
+  const scanBtn = document.getElementById("upload-scan-btn");
+  const clearBtn = document.getElementById("upload-clear-btn");
+  const desc = document.getElementById("upload-desc");
+  const result = document.getElementById("upload-result");
+  if (!fileEl || !scanBtn) return;
+
+  function esc(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  scanBtn.addEventListener("click", async () => {
+    const f = fileEl.files[0];
+    if (!f) { desc.textContent = "Pick a file first."; return; }
+    scanBtn.disabled = true;
+    desc.textContent = "Scanning " + f.name + " — " + Math.round(f.size / 1024) + " KB…";
+    const form = new FormData();
+    form.append("file", f);
+    try {
+      const r = await fetch("/api/upload/scan", { method: "POST", body: form });
+      const d = await r.json();
+      if (!d.ok) {
+        const hints = (d.hints || []).map(h => `<li>${esc(h)}</li>`).join("");
+        desc.textContent = "";
+        result.style.display = "block";
+        result.innerHTML =
+          '<div class="lab-hint" style="margin-top:0;border-left:3px solid #ef4444;">'
+          + "<strong>" + esc(d.error || "Upload rejected") + "</strong>"
+          + (hints ? '<ul style="margin:10px 0 0 18px;padding:0;">' + hints + "</ul>" : "")
+          + "</div>";
+        return;
+      }
+      render(d);
+    } catch (e) {
+      desc.textContent = "Network error: " + e.message;
+    } finally {
+      scanBtn.disabled = false;
+    }
+  });
+
+  function render(d) {
+    desc.textContent = d.rows_scanned + " of " + d.rows_total
+      + " rows scored · " + d.ring_cases_count + " ring(s) found · "
+      + d.high_risk_solo_count + " high-risk solo review(s) · "
+      + d.low_risk_solo_count + " low-risk row(s).";
+    const rings = d.ring_cases || [];
+    const solos = d.high_risk_solos || [];
+
+    let html = '<div class="lab-hint" style="margin-top:0;">'
+             + esc(d.evidence_line) + "</div>";
+
+    if (rings.length) {
+      html += '<h4 style="margin:18px 0 8px; font-size:11px; text-transform:uppercase; letter-spacing:0.06em; opacity:0.55;">Rings found</h4>';
+      html += rings.map(c => `
+        <div style="padding:10px 0; border-top:1px solid rgba(127,127,127,0.15);">
+          <strong>${esc(c.case_id)}</strong> · ${c.n_members} members · ${c.tier} · ${c.case_score_100}/100
+          <div style="opacity:0.7; font-size:12px; margin-top:4px;">
+            ${c.row_numbers.length} rows (${c.row_numbers.slice(0,8).join(", ")}${c.row_numbers.length>8?', …':''})
+            · ${esc(c.seller_ids.join(", ") || "no seller")}
+            · ${esc(c.signals.join(", ") || "no shared signals")}
+          </div>
+        </div>`).join("");
+    }
+
+    if (solos.length) {
+      html += '<h4 style="margin:18px 0 8px; font-size:11px; text-transform:uppercase; letter-spacing:0.06em; opacity:0.55;">High-risk individual reviews</h4>';
+      html += solos.map(s => `
+        <div style="padding:8px 0; border-top:1px solid rgba(127,127,127,0.15); font-size:12px;">
+          Row ${s.row_numbers[0]} · ${s.case_score_100}/100 ·
+          <code style="opacity:0.7;">${esc(s.case_id)}</code>
+        </div>`).join("");
+    }
+
+    if (!rings.length && !solos.length) {
+      html += '<div style="margin-top:14px; opacity:0.7; font-size:13px;">'
+           +  'No coordinated pattern and no high-risk review found. '
+           +  'Everything scored below 50 and no two rows shared evidence.'
+           +  '</div>';
+    }
+
+    html += '<a href="/api/upload/results.csv" download '
+         +  'style="display:inline-block; margin-top:14px; font-size:12px; color:#60a5fa;">'
+         +  'Download full results CSV</a>';
+
+    result.innerHTML = html;
+    result.style.display = "block";
+  }
+
+  clearBtn.addEventListener("click", async () => {
+    await fetch("/api/upload/clear", { method: "POST" });
+    result.style.display = "none";
+    desc.textContent = "";
+    fileEl.value = "";
+  });
+})();
+</script>
   </div>
 
   <script>
@@ -1184,6 +1342,48 @@
   </script>
 </section>
 
+  <!-- ============ 07 SELLERS ============ -->
+  <section data-view-panel="sellers" hidden>
+    <p class="hint">
+      Trust score per seller, 0–100. <b>Higher is safer.</b> Built from ring membership,
+      escalation share, per-review risk, infrastructure crowding and fresh accounts.
+      Moderator verdicts move the score: confirmations subtract, dismissals return.
+    </p>
+    <div class="panel">
+      <div class="panel-head">
+        <span class="panel-title">Seller Ledger</span>
+        <div class="filters">
+          <input class="input input-sm" id="sellerSearch" type="search"
+                 placeholder="Seller ID" autocomplete="off" spellcheck="false">
+          <select class="input input-sm" id="sellerBand" aria-label="Filter by band">
+            <option value="">All bands</option>
+            <option value="high_risk">High risk</option>
+            <option value="suspect">Suspect</option>
+            <option value="watch">Watch</option>
+            <option value="cautious">Cautious</option>
+            <option value="trusted">Trusted</option>
+          </select>
+          <span class="tag" id="sellerCount">0</span>
+        </div>
+      </div>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Seller</th>
+              <th class="r">Trust</th>
+              <th>Band</th>
+              <th class="r">Reviews</th>
+              <th>Why this score</th>
+            </tr>
+          </thead>
+          <tbody id="sellersBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
 </main>
 
 <div class="toast" id="toast" data-show="0"></div>
@@ -1252,6 +1452,7 @@
     if (v === "feed") loadFeed();
     if (v === "queue" && state.selected) drawGraph(state.selected.graph_data);
     if (v === "test" || v === "feed" || v === "arch") { /* no-op */ }
+    if (v === "sellers") loadSellers();
   }
 
   /* ---------- metrics ---------- */
@@ -1340,12 +1541,159 @@
     }).join("");
   }
 
+let DECISIONS = {};
+
+async function loadDecisions() {
+  try {
+    const r = await fetch("/api/decisions");
+    const d = await r.json();
+    DECISIONS = d.decisions || {};
+  } catch (e) {
+    DECISIONS = {};
+  }
+}
+
+function decisionBadge(caseId) {
+  const d = DECISIONS[caseId];
+  if (!d) return '<span class="mod-badge none">undecided</span>';
+  const label = { confirm: "confirmed", dismiss: "dismissed",
+                  need_info: "more info" }[d.action] || d.action;
+    if (!d || !d.action) return '<span class="mod-badge none">undecided</span>';
+  return `<span class="mod-badge ${d.action}">${label}</span>`;
+}
+
+function renderCaseDecision(caseId) {
+  const host = document.getElementById("caseDecision");
+  if (!host) return;
+  if (!caseId) { host.innerHTML = ""; return; }
+
+  const d = DECISIONS[caseId] || {};
+  const has = Boolean(d.action);
+
+  host.innerHTML = `
+    <div class="mod-row">
+      <button type="button" data-decide="confirm">Confirm</button>
+      <button type="button" data-decide="dismiss">Dismiss</button>
+      <button type="button" data-decide="need_info">Need more info</button>
+      ${has ? '<button type="button" data-clear="1" class="mod-clear">Clear</button>' : ""}
+    </div>
+    <div class="mod-meta">
+      ${decisionBadge(caseId)}
+      ${d.ts ? `<span>${new Date(d.ts).toLocaleString()}</span>` : ""}
+    </div>`;
+
+  host.querySelectorAll("button[data-decide]").forEach(function (b) {
+    b.addEventListener("click", function () {
+      decideCase(caseId, b.dataset.decide);
+    });
+  });
+  const cb = host.querySelector("button[data-clear]");
+  if (cb) cb.addEventListener("click", function () { clearDecision(caseId); });
+}
+
+async function decideCase(caseId, action, note = "") {
+  try {
+    const r = await fetch(`/api/case/${encodeURIComponent(caseId)}/decision`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action, note, moderator: "moderator-1" })
+    });
+    if (!r.ok) { console.warn("decision failed:", await r.text()); return null; }
+    const d = await r.json();
+    DECISIONS[caseId] = d.decision;
+    SELLERS = [];            // ledger must reflect the new verdict
+    if (window.activeCaseId === caseId) renderCaseDecision(caseId);
+    return d;
+  } catch (e) {
+    console.warn("decision error:", e);
+    return null;
+  }
+}
+
+  async function clearDecision(caseId) {
+    try {
+      const r = await fetch(
+        `/api/case/${encodeURIComponent(caseId)}/decision/clear`,
+        { method: "POST" });
+      if (!r.ok) { console.warn("clear failed:", await r.text()); return null; }
+      const d = await r.json();
+      delete DECISIONS[caseId];
+      SELLERS = [];
+      if (window.activeCaseId === caseId) renderCaseDecision(caseId);
+      return d;
+    } catch (e) {
+      console.warn("clear error:", e);
+      return null;
+    }
+  }
+
+  let SELLERS = [];
+
+  async function loadSellers(force) {
+    if (SELLERS.length && !force) { renderSellers(); return; }
+    const body = $("#sellersBody");
+    body.innerHTML = '<tr><td class="empty" colspan="6">Loading ledger…</td></tr>';
+    try {
+      const r = await fetch("/api/sellers/trust?full=1");
+      const d = await r.json();
+      SELLERS = (d.sellers || []).slice().sort((a, b) =>
+        (a.trust_score - b.trust_score) || (b.n_reviews - a.n_reviews));
+      renderSellers();
+    } catch (e) {
+      body.innerHTML = '<tr><td class="empty" colspan="6">Seller ledger unavailable</td></tr>';
+    }
+  }
+
+  function renderSellers() {
+    const q = ($("#sellerSearch").value || "").trim().toLowerCase();
+    const band = $("#sellerBand").value;
+    const list = SELLERS.filter(s => {
+      if (band && s.band !== band) return false;
+      if (!q) return true;
+      return String(s.seller_id).toLowerCase().indexOf(q) >= 0;
+    });
+
+    $("#sellerCount").textContent = (q || band)
+      ? list.length + " / " + SELLERS.length : SELLERS.length;
+
+    const body = $("#sellersBody");
+    if (!list.length) {
+      body.innerHTML = '<tr><td class="empty" colspan="6">No sellers match</td></tr>';
+      return;
+    }
+
+    body.innerHTML = list.map((s, i) => {
+      const score = Math.max(0, Math.min(100, Number(s.trust_score) || 0));
+      const col = score >= 80 ? "var(--ok)" : score >= 60 ? "var(--ink-2)"
+                : score >= 40 ? "var(--warn)" : "var(--crit)";
+      const adj = Number(s.moderation_adjustment || 0);
+      const adjTag = adj
+        ? ' <span style="font-size:10px;color:' + (adj < 0 ? "var(--crit)" : "var(--ok)")
+          + '">' + (adj > 0 ? "+" : "") + adj + "</span>"
+        : "";
+      const why = ((s.reasons || []).join(" · ")) || "—";
+      return "<tr>" +
+        '<td class="num dim" style="width:44px">' + (i + 1) + "</td>" +
+        '<td class="mono">' + esc(s.seller_id) + "</td>" +
+        '<td class="num"><div class="trust-cell">' +
+          '<span class="trust-bar"><i style="width:' + score + "%;background:" + col + '"></i></span>' +
+          "<strong>" + score + "</strong>" + adjTag +
+        "</div></td>" +
+        '<td><span class="band band-' + esc(s.band) + '">' +
+          esc(String(s.band).replace(/_/g, " ")) + "</span></td>" +
+        '<td class="num">' + (s.n_reviews || 0) + "</td>" +
+        '<td class="text-cell" title="' + esc(why) + '">' + esc(why) + "</td>" +
+        "</tr>";
+    }).join("");
+  }
+
   function selectCase(c) {
     state.selected = c;
     window.activeCaseId = c.case_id;
     $$("#casesBody tr").forEach(tr =>
       tr.setAttribute("aria-selected", String(tr.dataset.case === c.case_id)));
-    renderDetail(c);
+      renderDetail(c);
+    renderCaseDecision(c.case_id);
   }
 
   function renderDetail(c) {
@@ -1640,6 +1988,9 @@
     $$(".tab").forEach(b =>
       b.addEventListener("click", () => setView(b.dataset.view)));
 
+    $("#sellerSearch").addEventListener("input", renderSellers);
+    $("#sellerBand").addEventListener("change", renderSellers);
+
     $("#casesBody").addEventListener("click", e => {
       const tr = e.target.closest("tr[data-case]");
       if (!tr) return;
@@ -1699,7 +2050,7 @@
     applyTheme(document.documentElement.getAttribute("data-theme") || "dark");
     wire();
     setView("queue");
-    refresh();
+    loadDecisions().then(refresh);
     setInterval(refresh, 15000);
   });
 })();
